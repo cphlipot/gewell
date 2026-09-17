@@ -99,12 +99,12 @@ class MixedConversionTests(unittest.TestCase):
                     else:
                         self.assertEqual(manifest["tensors"][entry.physical_id]["input_scale"], .125)
 
-    def test_nvfp4_rejects_missing_or_unexecutable_input_scales(self):
+    def test_nvfp4_rejects_invalid_or_unexecutable_input_scales(self):
         from tests.test_fp8_artifact import fixture, tiny_specs
         with tempfile.TemporaryDirectory() as temporary:
             source = fixture(Path(temporary), mixed=False)
             for value in (None, 0, -1, True, "0.1", 1e-100, 1e100, float("nan")):
-                scales = {} if value is None else {tiny_specs()[1].name: value}
+                scales = {tiny_specs()[1].name: value}
                 with self.subTest(value=value), self.assertRaises(bf16.ArtifactError):
                     converter.prepare_source(source.path, tiny_specs(), "0 q_proj nvfp4_w4a4", scales)
 

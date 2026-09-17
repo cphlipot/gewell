@@ -49,8 +49,8 @@ Supported source encodings are BF16, FP16, FP32, E4M3 FP8 (with an optional
 scalar FP32 `weight_scale`), and packed NVFP4: U8 pairs of E2M1 weights,
 group-16 E4M3 `weight_scale`, and scalar FP32 `weight_scale_2`.
 Other quantization layouts require decoding to one of these encodings first.
-Packed projections also need an activation `input_scale` from the source or
-`--input-scales`.
+Activation `input_scale` values come from explicit overrides, the source, or
+the bundled reference calibration, as described below.
 
 ```bash
 SOURCE_DIR=/absolute/path/to/gemma4-31b-safetensors
@@ -85,14 +85,12 @@ For example:
 
 Later rules override earlier ones. Omitted projections retain their source
 storage; FP16 and FP32 inputs become BF16. Embeddings and norms use BF16.
-Newly quantized or requantized projections require calibrated activation
-scales in a JSON object keyed by logical name, such as
-`{"layers.0.gate_proj.weight": 0.125}`. That number illustrates syntax;
-measure scales for the intended model and recipe.
+Newly quantized or requantized projections use the bundled reference
+activation scales by default. No GPU or separate calibration file is required.
 
 ```bash
 python3 tools/convert.py --snapshot "$SOURCE_DIR" \
-  --mask /path/to/recipe.mask --input-scales /path/to/scales.json \
+  --mask /path/to/recipe.mask \
   --output /path/to/converted-model
 ```
 
@@ -100,7 +98,7 @@ Native `.gwt` input is also supported:
 
 ```bash
 python3 tools/convert.py --artifact "$MODEL_DIR/weights.gwt" \
-  --mask /path/to/recipe.mask --input-scales /path/to/scales.json \
+  --mask /path/to/recipe.mask \
   --output /path/to/repacked-model
 python3 tools/convert.py --verify /path/to/repacked-model/weights.gwt
 ```
@@ -108,7 +106,80 @@ python3 tools/convert.py --verify /path/to/repacked-model/weights.gwt
 A lower-precision source can be decoded to a higher-precision target. The
 converter warns and proceeds: storing NVFP4 values in BF16 or FP8 cannot
 recover information already lost during quantization. Unchanged native
-entries preserve their packed bytes and scales.
+entries preserve their packed bytes and scales unless an explicit activation
+scale override is supplied; that changes only the input scale.
+
+### G0 reference mask
+
+`tools/masks/g0.mask` supplies the G0 precision layout: **266 FP8 W8A8 and
+144 NVFP4 W4A4** text projections. Q/K/V use FP8 throughout. O and MLP
+projections use FP8 in layers **0–5, 10–11, 16–17, 22–23, 28–29, 34–35,
+40–41, 46–47, 52–53, and 58–59**, and NVFP4 elsewhere. These are zero-based
+indices: the first six-layer block, then every global layer and its preceding
+local layer. Embeddings and norms remain BF16.
+
+The mask specifies every text projection, so its precision layout is
+independent of source storage. Activation scales follow the
+[selection rules below](#activation-calibration), including the bundled
+measurements from the all-NVFP4 reference run.
+
+```bash
+python3 tools/convert.py --snapshot "$SOURCE_DIR" \
+  --mask tools/masks/g0.mask --plan
+python3 tools/convert.py --snapshot "$SOURCE_DIR" \
+  --mask tools/masks/g0.mask --output /path/to/g0-model
+```
+
+## Activation calibration
+
+For each quantized projection the converter selects its activation scale in
+this order:
+
+1. An explicit `--input-scales FILE` entry.
+2. The source's `input_scale`, if retaining that projection's quantization format.
+3. The bundled reference calibration for missing scales and changed formats.
+
+The shipped `tools/default_calibration.json` contains measured activation
+absolute maxima for all 410 text projections. The reference run observed 74
+histories (64 text, eight image, two video), up to 32,641 input tokens, using
+BF16 forward activations and quantize/dequantize (QDQ) of packed all-NVFP4
+weights. The converter derives a positive FP32 dequantization multiplier as
+`input_amax / 448` for FP8 and `input_amax / 2688` for NVFP4. These are saved
+reference measurements, not new measurements of the selected source or mask.
+Fine-tunes and different workloads may benefit from custom scales; the
+reference provenance never restricts which structurally compatible sources
+can be converted.
+
+When defaults are used, the converter prints one notice. `--plan` reports
+how many scales come from overrides, the source, and defaults. The output
+manifest records the resolved scales, their origins, and the default
+profile's provenance and checksum. BF16 projections need no activation scale.
+
+Optional overrides are a JSON object keyed by logical tensor name:
+
+```json
+{"layers.0.mlp.gate_proj.weight": 0.125}
+```
+
+The number illustrates syntax. Supply the dequantization multiplier for the
+**target** format, not an absolute maximum or reciprocal. A partial file
+overrides only its named projections; the usual source/default selection
+applies to the rest. Unknown names and invalid scales for quantized targets
+are rejected. Entries for projections left in BF16 are unused.
+
+```bash
+python3 tools/convert.py --snapshot "$SOURCE_DIR" \
+  --mask /path/to/recipe.mask --input-scales /path/to/scales.json \
+  --output /path/to/custom-calibrated-model
+```
+
+### Online calibration (coming later)
+
+Running calibration samples during conversion to measure activation ranges
+for the selected model and mask is not implemented yet. The current converter
+uses saved scales and runs on CPU with NumPy. Online calibration is intended
+to support layer-by-layer execution so the entire BF16 model need not fit in
+GPU memory; there is no calibration-dataset option in the converter today.
 
 ## Optional assistant and vision
 

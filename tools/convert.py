@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Convert target text projections to BF16, FP8 W8A8, or NVFP4 W4A4 storage.
 
-The sparse mask leaves omitted entries in their original storage. Input scales
-are calibrated dequantization multipliers, keyed by the logical tensor name.
+The sparse mask leaves omitted entries in their original storage. Activation
+scales use explicit overrides, retained source scales, then bundled reference
+calibration. Online calibration during conversion is coming later.
 Safetensors and native weights are accepted by structure, independently of provenance.
 """
 from __future__ import annotations
@@ -26,11 +27,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from tools import bf16_artifact as bf16
 from tools import nvfp4_artifact as native
-from tools.convert_bf16 import _publish_no_replace, _write_partial_manifest
 from tools.safetensors_source import (Weight, read_snapshot, materialize_bf16, warn_precision)
 from tools.serving_assets import MANIFEST_SCHEMA_VERSION, publish_serving_assets, read_serving_assets
 
 ARTIFACT_FILENAME = "weights.gwt"
+DEFAULT_CALIBRATION = Path(__file__).with_name("default_calibration.json")
 STORAGE_NAMES = {native.StorageType.BF16: "bf16", native.StorageType.NVFP4_W4A4: "nvfp4_w4a4",
                  native.StorageType.FP8_W8A8: "fp8_w8a8"}
 
@@ -145,15 +146,49 @@ def validate_input_scale(value, name):
     native.require(type(value) in (int, float) and math.isfinite(value) and value > 0,
                    f"missing or invalid calibrated input scale: {name}")
     try:
-        native.validate_gemm_globals(struct.pack("<2f", 1.0, value))
+        _, value = native.validate_gemm_globals(struct.pack("<2f", 1.0, value))
     except (OverflowError, struct.error) as error:
         raise bf16.ArtifactError(f"input scale is not finite positive FP32: {name}") from error
     return value
 
 
+def resolve_input_scales(specs, selected, overrides, retained):
+    """Resolve target-format dequantization scales without executing the model."""
+    native.require(isinstance(overrides, dict), "input scales must be a JSON object")
+    names = {spec.name for spec in specs if spec.role in native.TARGET_ROLES}
+    native.require(not (overrides.keys() - names),
+                   f"unknown input scale names: {sorted(overrides.keys() - names)}")
+    scales, origins, profile = {}, {}, None
+    for spec, storage in zip(specs, selected, strict=True):
+        if storage == native.StorageType.BF16:
+            continue
+        if spec.name in overrides:
+            value, origin = overrides[spec.name], "explicit"
+        elif retained.get(spec.name) is not None:
+            value, origin = retained[spec.name], "source"
+        else:
+            if profile is None:
+                profile = bf16.load_json_object(DEFAULT_CALIBRATION)
+            amax = profile["input_amax"].get(spec.name)
+            native.require(type(amax) in (int, float) and math.isfinite(amax) and amax > 0,
+                           f"missing or invalid default activation range: {spec.name}; supply --input-scales")
+            divisor = 448.0 if storage == native.StorageType.FP8_W8A8 else 2688.0
+            value, origin = amax / divisor, "default"
+        scales[spec.name] = validate_input_scale(value, spec.name)
+        origins[spec.name] = origin
+    calibration = {"origins": origins}
+    if profile is not None:
+        calibration["default_profile"] = {"profile": profile["profile"],
+            "sha256": bf16.sha256_file(DEFAULT_CALIBRATION), "provenance": profile["provenance"]}
+        count = sum(origin == "default" for origin in origins.values())
+        print(f"Using bundled reference calibration {profile['profile']} for {count} projection(s); "
+              "these ranges were not measured on this source or mask. "
+              "Override with --input-scales; online calibration is coming later.", file=sys.stderr)
+    return scales, calibration
+
+
 def prepare_source(path: Path, specs: Sequence[bf16.TensorSpec], mask: str,
                    input_scales: dict, *, verify: bool = True):
-    native.require(isinstance(input_scales, dict), "input scales must be a JSON object")
     original = identity(path)
     with path.open("rb") as source:
         magic = source.read(8)
@@ -165,15 +200,19 @@ def prepare_source(path: Path, specs: Sequence[bf16.TensorSpec], mask: str,
         header, entries = native.read_metadata(path, specs, native=is_native)
         artifact = bf16.VerifiedArtifact(path, header, entries, "")
     selected = native.parse_mask(mask, specs, initial=tuple(entry.storage_type for entry in artifact.entries))
-    for spec, entry, storage in zip(specs, artifact.entries, selected, strict=True):
-        if storage != entry.storage_type and storage != native.StorageType.BF16:
-            validate_input_scale(input_scales.get(spec.name), spec.name)
+    retained = {}
+    with path.open("rb") as source:
+        for spec, entry, storage in zip(specs, artifact.entries, selected, strict=True):
+            if storage == entry.storage_type and storage != native.StorageType.BF16:
+                source.seek(entry.file_offset + entry.byte_length - 4)
+                retained[spec.name], = struct.unpack("<f", bf16._read_exact(source, 4, "input scale"))
+    scales, calibration = resolve_input_scales(specs, selected, input_scales, retained)
     native.require(identity(path) == original, "source changed during verification")
     warn_precision([Weight(bf16.SourceTensor(path, path.name, spec.source_name, entry.file_offset, entry.byte_length),
                            "BF16" if entry.storage_type == native.StorageType.BF16 else
                            "F8_E4M3" if entry.storage_type == native.StorageType.FP8_W8A8 else "U8", spec.shape)
                     for spec, entry in zip(specs, artifact.entries, strict=True)], selected)
-    return artifact, selected, original
+    return artifact, selected, original, scales, calibration
 
 
 def native_weight(path, spec, entry, temporary):
@@ -204,17 +243,16 @@ def native_weight(path, spec, entry, temporary):
 
 
 def prepare_snapshot(path, specs, mask, input_scales):
-    native.require(isinstance(input_scales, dict), "input scales must be a JSON object")
     source = read_snapshot(path, specs)
     initial = [weight.storage if spec.role in native.TARGET_ROLES else native.StorageType.BF16
                for spec, weight in zip(specs, source.weights, strict=True)]
     selected = native.parse_mask(mask, specs, initial=initial)
     warn_precision(source.weights, selected)
-    for spec, weight, storage in zip(specs, source.weights, selected, strict=True):
-        if storage != native.StorageType.BF16:
-            value = input_scales.get(spec.name, weight.input_scale if storage == weight.storage else None)
-            validate_input_scale(value, spec.name)
-    return source, selected
+    retained = {spec.name: weight.input_scale
+                for spec, weight, storage in zip(specs, source.weights, selected, strict=True)
+                if storage == weight.storage}
+    scales, calibration = resolve_input_scales(specs, selected, input_scales, retained)
+    return source, selected, scales, calibration
 
 
 def build_manifest(artifact, specs, origins, mask, input_scales, source_info, serving):
@@ -265,18 +303,31 @@ def is_snapshot(path):
     return path.is_dir() or path.suffix == ".safetensors"
 
 
+def _write_partial_manifest(path, manifest):
+    with path.open("xb") as output:
+        output.write(bf16.canonical_json_bytes(manifest))
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def _publish_no_replace(partial, final):
+    os.link(partial, final)
+    partial.unlink()
+
+
 def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
             serving_snapshot: Path | None = None) -> tuple[Path, Path]:
     specs = bf16.expected_tensor_specs()
     snapshot = is_snapshot(source_path)
     if snapshot:
-        source, selected = prepare_snapshot(source_path, specs, mask, input_scales)
+        source, selected, scales, calibration = prepare_snapshot(source_path, specs, mask, input_scales)
         config_hash, index_hash = source.config_sha256, source.index_sha256
         source_info = {"snapshot": str(source.path)}
     else:
-        source, selected, original = prepare_source(source_path, specs, mask, input_scales)
+        source, selected, original, scales, calibration = prepare_source(source_path, specs, mask, input_scales)
         config_hash, index_hash = source.header.config_sha256, source.header.source_index_sha256
         source_info = {"artifact": str(source.path), "file_sha256": source.file_sha256}
+    source_info["calibration"] = calibration
     assets = read_serving_assets(serving_snapshot or (source_path if source_path.is_dir() else source_path.parent))
     output.mkdir(parents=True, exist_ok=True)
     artifact_path, manifest_path = output / ARTIFACT_FILENAME, output / "manifest.json"
@@ -293,7 +344,8 @@ def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
                 for i, (spec, storage) in enumerate(zip(specs, selected, strict=True)):
                     with tempfile.TemporaryDirectory(dir=temporary) as tensor_directory:
                         scratch = Path(tensor_directory)
-                        if not snapshot and storage == source.entries[i].storage_type:
+                        if (not snapshot and storage == source.entries[i].storage_type and
+                                calibration["origins"].get(spec.name) != "explicit"):
                             entry = source.entries[i]
                             weight = bf16.SourceTensor(source_path, source_path.name, spec.source_name, entry.file_offset, entry.byte_length)
                             origins.append(weight)
@@ -302,9 +354,8 @@ def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
                         weight = source.weights[i] if snapshot else native_weight(source_path, spec, source.entries[i], scratch)
                         origins.append(weight.tensor)
                         if storage == weight.storage and storage != native.StorageType.BF16:
-                            scale = input_scales.get(spec.name, weight.input_scale)
                             yield native.TensorSource(weight.tensor, storage, weight.block_scales,
-                                                      struct.pack("<2f", weight.weight_scale, scale))
+                                                      struct.pack("<2f", weight.weight_scale, scales[spec.name]))
                         else:
                             decoded = materialize_bf16(weight, scratch / "decoded")
                             if storage == native.StorageType.BF16:
@@ -312,7 +363,7 @@ def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
                             else:
                                 print(f"Quantizing {spec.name}", flush=True)
                                 quantizer = quantize_tensor if storage == native.StorageType.FP8_W8A8 else quantize_nvfp4_tensor
-                                yield quantizer(decoded, scratch / "packed", input_scales[spec.name])
+                                yield quantizer(decoded, scratch / "packed", scales[spec.name])
             artifact = native.write_artifact_partial(partial, specs, declarations(),
                 config_sha256=config_hash, index_sha256=index_hash, mixed=True)
             if snapshot:
@@ -322,7 +373,7 @@ def convert(source_path: Path, mask: str, input_scales: dict, output: Path,
             verified = native.verify_artifact_file(partial, specs)
             native.require(verified.file_sha256 == artifact.file_sha256, "artifact changed during verification")
             serving = publish_serving_assets(assets, output)
-            _write_partial_manifest(manifest_partial, build_manifest(artifact, specs, origins, mask, input_scales, source_info, serving))
+            _write_partial_manifest(manifest_partial, build_manifest(artifact, specs, origins, mask, scales, source_info, serving))
         _publish_no_replace(partial, artifact_path)
         published = True
         _publish_no_replace(manifest_partial, manifest_path)
@@ -346,7 +397,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     inputs.add_argument("--snapshot", type=Path, help="Gemma 4 31B safetensors file or directory")
     inputs.add_argument("--artifact", type=Path, help="native source weights")
     parser.add_argument("--mask", type=Path, help="LAYER PROJECTION TYPE mask; omitted projections retain source storage")
-    parser.add_argument("--input-scales", type=Path, help="JSON map of logical tensor names to calibrated activation scales")
+    parser.add_argument("--input-scales", type=Path,
+                        help="optional JSON map of logical tensor names to target-format activation scales; "
+                             "overrides source scales and bundled reference defaults")
     parser.add_argument("--serving-snapshot", type=Path, help="directory containing tokenizer.json; defaults to the source directory")
     parser.add_argument("--output", type=Path, help="bundle directory containing weights.gwt and manifest.json")
     parser.add_argument("--plan", action="store_true", help="validate structure/scales and report sizes without writing weights")
@@ -367,14 +420,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         scales = bf16.load_json_object(args.input_scales) if args.input_scales else {}
         if args.plan:
             if args.snapshot:
-                _, selected = prepare_snapshot(source_path, specs, mask, scales)
+                _, selected, _, calibration = prepare_snapshot(source_path, specs, mask, scales)
             else:
-                _, selected, _ = prepare_source(source_path, specs, mask, scales, verify=False)
+                _, selected, _, _, calibration = prepare_source(source_path, specs, mask, scales, verify=False)
             read_serving_assets(args.serving_snapshot or (source_path if source_path.is_dir() else source_path.parent))
             sizes = [native.tensor_bytes(spec, storage) for spec, storage in zip(specs, selected, strict=True)]
             print(json.dumps({"format": native.MIXED_FORMAT_NAME,
                               "fp8_projections": sum(x == native.StorageType.FP8_W8A8 for x in selected),
                               "nvfp4_projections": sum(x == native.StorageType.NVFP4_W4A4 for x in selected),
+                              "activation_scales": {origin: sum(value == origin for value in calibration["origins"].values())
+                                                    for origin in ("explicit", "source", "default")},
+                              "default_calibration": calibration.get("default_profile"),
                               "logical_data_bytes": sum(sizes),
                               "file_bytes": bf16.data_offset_for_count(len(specs)) + sum(map(bf16.align_up, sizes))}, indent=2))
         else:

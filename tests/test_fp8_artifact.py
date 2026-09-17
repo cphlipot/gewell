@@ -19,9 +19,9 @@ from tests.test_nvfp4_artifact import rewrite_hashes
 def tiny_specs():
     return (
         bf16.TensorSpec(0, -1, bf16.Role.EMBED_TOKENS, "embed_tokens.weight", "embed.weight", (2, 3)),
-        bf16.TensorSpec(1, 0, bf16.Role.Q_PROJ, "layers.0.q_proj.weight", "q.weight", (2, 16)),
-        bf16.TensorSpec(2, 0, bf16.Role.GATE_PROJ, "layers.0.gate_proj.weight", "gate.weight", (2, 16)),
-        bf16.TensorSpec(3, 0, bf16.Role.UP_PROJ, "layers.0.up_proj.weight", "up.weight", (2, 16)),
+        bf16.TensorSpec(1, 0, bf16.Role.Q_PROJ, "layers.0.self_attn.q_proj.weight", "q.weight", (2, 16)),
+        bf16.TensorSpec(2, 0, bf16.Role.GATE_PROJ, "layers.0.mlp.gate_proj.weight", "gate.weight", (2, 16)),
+        bf16.TensorSpec(3, 0, bf16.Role.UP_PROJ, "layers.0.mlp.up_proj.weight", "up.weight", (2, 16)),
     )
 
 
@@ -202,23 +202,24 @@ class Fp8ConversionTests(unittest.TestCase):
             artifact = bf16.write_artifact_partial(directory / "baseline", tiny_specs(), sources,
                                                    config_sha256="a" * 64,
                                                    index_sha256="b" * 64)
-            source, selected, _ = converter.prepare_source(artifact.path, tiny_specs(), "0 q_proj fp8_w8a8", {tiny_specs()[1].name: .125})
+            source, selected, _, _, _ = converter.prepare_source(artifact.path, tiny_specs(), "0 q_proj fp8_w8a8", {tiny_specs()[1].name: .125})
             self.assertEqual(source.file_sha256, artifact.file_sha256)
             self.assertEqual(selected[1], native.StorageType.FP8_W8A8)
 
-    def test_missing_invalid_calibration_and_packed_reinterpretation(self):
+    def test_invalid_calibration_and_packed_reinterpretation(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = fixture(Path(temporary), mixed=False)
             for value in (None, 0, -1, float("inf"), float("nan"), True, "0.1", 1e-100, 1e100):
-                scales = {} if value is None else {tiny_specs()[1].name: value}
+                scales = {tiny_specs()[1].name: value}
                 with self.subTest(value=value), self.assertRaises(bf16.ArtifactError):
                     converter.prepare_source(source.path, tiny_specs(), "0 q_proj fp8_w8a8", scales)
             with self.assertWarnsRegex(UserWarning, "lower precision"):
                 converter.prepare_source(source.path, tiny_specs(), "0 gate_proj bf16", {})
-            with self.assertRaisesRegex(bf16.ArtifactError, "input scale"):
-                converter.prepare_source(source.path, tiny_specs(), "0 gate_proj fp8_w8a8", {})
-            with self.assertRaisesRegex(bf16.ArtifactError, "calibrated input scale"):
-                converter.prepare_source(source.path, tiny_specs(), "0 up_proj nvfp4_w4a4", {})
+            with self.assertWarnsRegex(UserWarning, "lower precision"):
+                _, _, _, scales, _ = converter.prepare_source(source.path, tiny_specs(), "0 gate_proj fp8_w8a8", {})
+            self.assertAlmostEqual(scales[tiny_specs()[2].name], 82 / 448)
+            _, _, _, scales, _ = converter.prepare_source(source.path, tiny_specs(), "0 up_proj nvfp4_w4a4", {})
+            self.assertAlmostEqual(scales[tiny_specs()[3].name], 82 / 2688)
 
 
 if __name__ == "__main__":

@@ -19,8 +19,8 @@ from tools.serving_assets import REQUIRED_ASSETS, validate_serving_assets
 def specs():
     return (
         bf16.TensorSpec(0, -1, bf16.Role.EMBED_TOKENS, "embed_tokens.weight", "embed.weight", (2, 16)),
-        bf16.TensorSpec(1, 0, bf16.Role.GATE_PROJ, "layers.0.gate_proj.weight", "gate.weight", (129, 80)),
-        bf16.TensorSpec(2, 0, bf16.Role.UP_PROJ, "layers.0.up_proj.weight", "up.weight", (3, 32)),
+        bf16.TensorSpec(1, 0, bf16.Role.GATE_PROJ, "layers.0.mlp.gate_proj.weight", "gate.weight", (129, 80)),
+        bf16.TensorSpec(2, 0, bf16.Role.UP_PROJ, "layers.0.mlp.up_proj.weight", "up.weight", (3, 32)),
     )
 
 
