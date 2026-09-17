@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "chat-mixed",
+      "endpoint": "chat",
+      "sessions": 24,
+      "warmup_sessions": 2,
+      "repetitions": 3,
+      "concurrency": [1, 4, 8],
+      "defaults": {"temperature": 0, "max_tokens": 256},
+      "cases": [
+        {"name": "short-answer", "body": {"max_tokens": 32, "messages": [{"role": "user", "content": "Give three practical uses for a paperclip."}]}},
+        {"name": "long-answer", "body": {"max_tokens": 1024, "messages": [{"role": "user", "content": "Explain how a database transaction works, with detailed examples of atomicity, consistency, isolation, and durability."}]}}
+      ]
+    },
+    {
+      "name": "text-completion",
+      "endpoint": "text",
+      "sessions": 16,
+      "warmup_sessions": 2,
+      "repetitions": 3,
+      "concurrency": [1, 4, 8],
+      "defaults": {"temperature": 0, "max_tokens": 256},
+      "cases": [
+        {"name": "continuation", "body": {"prompt": "A practical guide to designing a small vegetable garden:\n\n1."}}
+      ]
+    },
+    {
+      "name": "shared-prefix",
+      "endpoint": "chat",
+      "sessions": 24,
+      "warmup_sessions": 0,
+      "repetitions": 3,
+      "concurrency": [1, 4, 8],
+      "defaults": {"temperature": 0, "max_tokens": 128},
+      "cases": [
+        {"name": "schedule", "body": {"messages": [{"role": "system", "content": "You help maintain a community garden. The garden has six beds, a rainwater tank, a shared tool shed, and ten volunteers. Two beds contain tomatoes, two contain beans, one contains herbs, and one is empty. The tank holds 500 liters. Volunteers meet on Tuesday and Saturday mornings. Make practical suggestions using this shared context."}, {"role": "user", "content": "Propose a watering schedule."}]}},
+        {"name": "empty-bed", "body": {"messages": [{"role": "system", "content": "You help maintain a community garden. The garden has six beds, a rainwater tank, a shared tool shed, and ten volunteers. Two beds contain tomatoes, two contain beans, one contains herbs, and one is empty. The tank holds 500 liters. Volunteers meet on Tuesday and Saturday mornings. Make practical suggestions using this shared context."}, {"role": "user", "content": "Suggest a use for the empty bed."}]}}
+      ]
+    },
+    {
+      "name": "growing-chat",
+      "endpoint": "chat",
+      "sessions": 8,
+      "warmup_sessions": 1,
+      "repetitions": 3,
+      "concurrency": [1, 4, 8],
+      "defaults": {"temperature": 0, "max_tokens": 256},
+      "cases": [
+        {"name": "design-review", "body": {"messages": [{"role": "user", "content": "Design a small library lending system. Explain its core data and operations."}]}, "followups": [{"role": "user", "content": "Add support for reservations and explain the edge cases."}, {"role": "user", "content": "Now propose a migration and testing plan for the design we discussed."}]}
+      ]
+    },
+    {
+      "name": "arrival-rate",
+      "endpoint": "chat",
+      "sessions": 32,
+      "warmup_sessions": 2,
+      "repetitions": 3,
+      "concurrency": [8],
+      "arrival_rates": [0.5, 2, 8],
+      "defaults": {"temperature": 0, "max_tokens": 128},
+      "cases": [{"name": "summary", "body": {"messages": [{"role": "user", "content": "Explain why seasons change on Earth."}]}}]
+    }
+  ]
+}

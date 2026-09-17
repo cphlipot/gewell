@@ -1,0 +1,11 @@
+/build/
+/.venv/
+__pycache__/
+*.py[cod]
+
+# Keep model bundles and generated request data outside the source repository.
+*.safetensors
+*.gwt
+*.u32
+*.bf16
+.gewell-export.json
