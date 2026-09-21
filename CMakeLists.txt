@@ -248,6 +248,9 @@ if(BUILD_TESTING)
     gewell_cuda_target(gewell_${benchmark}_benchmark)
     target_link_libraries(gewell_${benchmark}_benchmark PRIVATE gewell_gemma4_31b_sm120)
   endforeach()
+  add_executable(gewell_teacher_replay_benchmark EXCLUDE_FROM_ALL tests/teacher_replay_benchmark.cu)
+  gewell_cuda_target(gewell_teacher_replay_benchmark)
+  target_link_libraries(gewell_teacher_replay_benchmark PRIVATE gewell_gemma4_31b_sm120)
 endif()
 
 # Local research targets are omitted from the public source export.

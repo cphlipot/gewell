@@ -58,6 +58,7 @@ Sampling parameters for HTTP and batch/jobs are supplied per request.
 ## Execution and cache
 
 The first seven options below apply to serving, jobs, generation, captioning,
+and offline batches. The logical prefill budget applies only to serving, jobs,
 and offline batches. Cache budget/checkpoint options apply to serving and jobs.
 
 | Option | Default | Meaning |
@@ -67,12 +68,20 @@ and offline batches. Cache budget/checkpoint options apply to serving and jobs.
 | `--nvfp4-activation-policy POLICY` | `always` | `always` or `prefill`; the latter keeps NVFP4 decode/MTP activations BF16 |
 | `--kv-local-format FORMAT` | `bf16` | Local KV storage: `bf16` or `fp8` |
 | `--kv-global-format FORMAT` | `bf16` | Compact global KV storage: `bf16` or `fp8` |
-| `--attention-local-compute FORMAT` | `bf16` | Local text-prefill matmuls: `bf16` or `fp8` |
-| `--attention-global-compute FORMAT` | `bf16` | Global text-prefill matmuls: `bf16` or `fp8` |
+| `--attention-local-compute FORMAT` | `bf16` | Local text attention (prefill, decode, MTP): `bf16` or `fp8` |
+| `--attention-global-compute FORMAT` | `bf16` | Global text attention (prefill, decode, MTP): `bf16` or `fp8` |
+| `--prefill-budget-tokens N` | `0` | Soft prefill token budget between decode opportunities; 0 runs decode after each chunk/head |
 | `--kv-cache-gpu-mib N` | required for `serve-http`; positional for `run-jobs` | Positive GPU KV budget |
 | `--kv-cache-cpu-mib N` | `0` | Host prefix-cache budget; zero disables cold storage |
-| `--kv-cache-index-mib N` | `64` | Positive host cache-index budget |
+| `--kv-cache-index-mib N` | `512` | Positive host cache-index budget |
 | `--kv-checkpoint-interval-tokens N` | `8192` | Periodic checkpoint spacing; zero disables periodic captures |
+
+Positive logical budgets group existing microbatches; they do not enlarge GPU
+microbatches or reserve additional KV. Chunks/image spans remain atomic and
+may overshoot the budget; first-token heads count as one token. Polling and
+first-token emission continue between chunks. Blocked prefill falls back to
+decode immediately. Larger budgets can improve throughput at the cost of
+longer inter-token gaps; TTFT depends on the workload.
 
 ## HTTP options
 

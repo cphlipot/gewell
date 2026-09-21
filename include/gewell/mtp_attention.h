@@ -36,6 +36,17 @@ struct BatchInput {
   mtp_target::BFloat16* context{};
 };
 
+// Native E4M3 QK and PV with FP32 softmax/accumulation. Q/K/V scales are
+// per vector; V scales are folded into P before per-query/tile P quantization.
+// Uses the same bounded scratch as BF16 and never modifies cached/staged KV.
+// frozen=true accepts one query per input over [0,base_position), for ordinary
+// decode after commit and assistant attention; otherwise current rows are causal.
+void run_fp8_batch(const std::vector<BatchInput>& inputs,
+                   const mtp_target::BFloat16* global_k_norm,
+                   gemma4_31b::AttentionKind kind, void* scratch,
+                   std::size_t scratch_size, cudaStream_t stream,
+                   bool frozen = false);
+
 // Coalesce independent request tiles into common launches, with disjoint
 // partial results in the caller's existing scratch. Splits balance visible KV
 // work within each launch, subject to a block target and scratch capacity.

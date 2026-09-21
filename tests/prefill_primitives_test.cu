@@ -182,6 +182,7 @@ class GuardedTensorScratch {
       : bytes_(tensor_attention_scratch_bytes(rows)),
         storage_(bytes_ + 2 * kGuardBytes) {
     storage_.fill_byte(0x5a);
+    check_cuda(cudaMemset(get(), 0xff, bytes_), "poison tensor scratch");
   }
 
   std::uint8_t* get() { return storage_.get() + kGuardBytes; }
@@ -2298,7 +2299,7 @@ bool run_tests(std::ostream& report, std::string* failure) {
     test_runtime_compact_global_cached_chunk(
         report, kTokenCount, kTokenCount, 2 * kTokenCount,
         "runtime_chunk_compact_global_full_base1024");
-    for (const std::uint32_t rows : {1U, 17U, 33U, 501U, 509U, 1024U}) {
+    for (const std::uint32_t rows : {1U, 17U, 33U, 501U, 509U, 973U, 1024U}) {
       constexpr std::uint32_t kLongBase = 20'477;
       test_runtime_cached_chunk(
           report, gemma4_31b::AttentionKind::local, kLongBase, rows,
@@ -2307,15 +2308,16 @@ bool run_tests(std::ostream& report, std::string* failure) {
           report, kLongBase, rows, kLongBase + rows,
           "runtime_chunk_compact_global_variable_long_history");
     }
-    for (const std::uint32_t rows : {511U, 512U, 513U, 767U, 768U, 769U}) {
+    for (const std::uint32_t rows : {33U, 34U, 39U, 40U, 41U, 255U, 256U, 257U,
+                                    511U, 512U, 513U, 767U, 768U, 769U, 973U, 1023U}) {
       test_runtime_cached_chunk(
           report, gemma4_31b::AttentionKind::local, 2045, rows,
-          kTokenCount, "runtime_chunk_local_query_slices", 1.0F, rows == 769);
+          kTokenCount, "runtime_chunk_local_query_slices", 1.0F, rows == 769 || rows == 973);
     }
-    for (const std::uint32_t rows : {767U, 768U, 769U, 1024U}) {
+    for (const std::uint32_t rows : {767U, 768U, 769U, 973U, 1023U, 1024U}) {
       test_runtime_cached_chunk(
           report, gemma4_31b::AttentionKind::global, 2045, rows,
-          2045 + rows, "runtime_chunk_global_query_slices", 1.0F, rows == 1024);
+          2045 + rows, "runtime_chunk_global_query_slices", 1.0F, rows >= 768);
       test_runtime_compact_global_cached_chunk(
           report, 2045, rows, 2045 + rows, "runtime_chunk_compact_global_query_slices");
     }
@@ -2345,6 +2347,8 @@ bool run_tests(std::ostream& report, std::string* failure) {
         2045, 33, 2078, "modular_global_peaked_multitile", 64.0F);
     test_runtime_cached_chunk(report, gemma4_31b::AttentionKind::global,
         2045, 768, 2813, "modular_global_sliced_peaked_multitile", 64.0F);
+    test_runtime_cached_chunk(report, gemma4_31b::AttentionKind::global,
+        2045, 973, 3018, "modular_global_ragged_sliced_peaked_multitile", 64.0F, true);
     test_runtime_compact_global_cached_chunk(report, 259, 33, 512,
         "cached_compact_peaked_softmax", 64.0F);
     test_runtime_compact_global_cached_chunk(report, 65'503, 33, 65'536,

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gewell/kv_format.h"
+#include "gewell/attention_compute.h"
 
 #include "gewell/models/gemma4/31b/model.h"
 #include "gewell/models/gemma4/31b/sm120/fp8_projections.h"
@@ -80,7 +81,9 @@ class Verifier {
            std::uint32_t context_capacity = 262'144,
            const nvfp4::Weights* native_weights = nullptr,
            nvfp4::ActivationPolicy activation_policy = nvfp4::ActivationPolicy::always,
-           const fp8::Weights* fp8_weights = nullptr);
+           const fp8::Weights* fp8_weights = nullptr,
+           attention::Compute local_compute = attention::Compute::bf16,
+           attention::Compute global_compute = attention::Compute::bf16);
   ~Verifier();
   Verifier(const Verifier&) = delete;
   Verifier& operator=(const Verifier&) = delete;

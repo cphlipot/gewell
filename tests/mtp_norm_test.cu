@@ -22,9 +22,9 @@ __global__ void fill(BF16* values, unsigned count, unsigned tag) {
   values[i] = __float2bfloat16_rn((int(hash & 255) - 127) * scale);
 }
 
-void require_equal(const Buffer& actual, const Buffer& expected) {
-  std::vector<unsigned short> a(actual.size() / 2), b(a.size());
-  check(cudaMemcpy(a.data(), actual.data(), actual.size(), cudaMemcpyDeviceToHost),
+void require_equal(const BF16* actual, const Buffer& expected) {
+  std::vector<unsigned short> a(expected.size() / 2), b(a.size());
+  check(cudaMemcpy(a.data(), actual, expected.size(), cudaMemcpyDeviceToHost),
         "read fused normalization");
   check(cudaMemcpy(b.data(), expected.data(), expected.size(), cudaMemcpyDeviceToHost),
         "read separate normalization");
@@ -34,9 +34,17 @@ void require_equal(const Buffer& actual, const Buffer& expected) {
 template <bool Scale>
 void test(unsigned rows) {
   const unsigned count = rows * kHidden;
-  Buffer original(count * 2), branch(count * 2), residual(count * 2),
-      expected(count * 2), temporary(count * 2), output(count * 2),
+  Buffer original(count * 2), residual(count * 2),
+      expected(count * 2), temporary(count * 2),
       expected_output(count * 2), post(kHidden * 2), next(kHidden * 2), scalar(2);
+  // Production h0/h1/h2 are disjoint slices of one allocation. Keep that
+  // contract here, with BF16-only alignment and a guard at each slice boundary.
+  const unsigned stride = count + 2;
+  Buffer state(3 * stride * 2);
+  auto* branch = state.at<BF16>(2);
+  auto* residual_view = state.at<BF16>((stride + 1) * 2);
+  auto* output = state.at<BF16>((2 * stride + 1) * 2);
+  check(cudaMemset(state.data(), 0xa5, state.size()), "initialize normalization guards");
   const auto initialize = [](Buffer& buffer, unsigned tag) {
     const unsigned count = buffer.size() / 2;
     fill<<<(count + 255) / 256, 256>>>(buffer.at<BF16>(0), count, tag);
@@ -58,22 +66,32 @@ void test(unsigned rows) {
     p::trained_scalar(expected.at<BF16>(0), scalar.at<BF16>(0), count);
   p::rms_norm(expected.at<BF16>(0), next.at<BF16>(0), expected_output.at<BF16>(0),
               rows, kHidden);
-  check(cudaMemcpy(branch.data(), original.data(), original.size(), cudaMemcpyDeviceToDevice),
+  check(cudaMemcpy(branch, original.data(), original.size(), cudaMemcpyDeviceToDevice),
         "copy normalization input");
+  check(cudaMemcpy(residual_view, residual.data(), residual.size(), cudaMemcpyDeviceToDevice),
+        "copy normalization residual");
   norm::residual_norm<Scale><<<rows, norm::kNormThreads>>>(
-      branch.at<BF16>(0), post.at<BF16>(0), residual.at<BF16>(0), scalar.at<BF16>(0),
-      next.at<BF16>(0), output.at<BF16>(0));
+      branch, post.at<BF16>(0), residual_view, Scale ? scalar.at<BF16>(0) : nullptr,
+      next.at<BF16>(0), output);
   check(cudaGetLastError(), "fused normalization launch");
   require_equal(branch, expected);
   require_equal(output, expected_output);
+  require_equal(residual_view, residual);
+  for (unsigned slice = 0; slice < 3; ++slice)
+    for (unsigned offset : {slice * stride, (slice + 1) * stride - 1}) {
+      unsigned short guard;
+      check(cudaMemcpy(&guard, state.at<BF16>(offset * 2), 2, cudaMemcpyDeviceToHost),
+            "read normalization guard");
+      if (guard != 0xa5a5) throw std::runtime_error("normalization modified a slice guard");
+    }
   std::cout << "rows=" << rows << " scale=" << Scale
-            << " residual=exact normalized=exact\n";
+            << " residual=exact normalized=exact shared_slices=exact guards=exact\n";
 }
 }  // namespace
 
 int main() {
   try {
-    for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 17U, 1280U}) {
+    for (unsigned rows : {1U, 2U, 3U, 4U, 5U, 17U, 32U, 64U, 128U, 129U, 512U, 1280U}) {
       test<false>(rows);
       test<true>(rows);
     }

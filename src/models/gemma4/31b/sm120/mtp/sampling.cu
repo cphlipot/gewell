@@ -639,11 +639,11 @@ struct SelectionCandidate {
 // candidates in its own tile, so it cannot enter the global top-k. Stable sorts
 // and contiguous tile order retain lower-token-ID ties through every merge.
 template <int Items, bool Final>
-__global__ void compact_candidates_kernel(
+__device__ __forceinline__ void compact_candidates_body(
     const __nv_bfloat16* logits, const SelectionCandidate* input,
     unsigned count, float temperature, const std::uint32_t* allowed_tokens,
     unsigned retained, float top_p, SelectionCandidate* candidates,
-    TokenProbability* output, Status* status) {
+    TokenProbability* output, Status* status, unsigned tile) {
   using Sort = cub::BlockRadixSort<float, kThreads, Items, std::uint32_t>;
   using TokenSort = cub::BlockRadixSort<std::uint32_t, kThreads, Items, float>;
   using Scan = cub::BlockScan<float, kThreads>;
@@ -657,7 +657,7 @@ __global__ void compact_candidates_kernel(
   float scores[Items];
   std::uint32_t tokens[Items];
   for (unsigned item = 0; item < Items; ++item) {
-    const unsigned index = blockIdx.x * kThreads * Items + threadIdx.x * Items + item;
+    const unsigned index = tile * kThreads * Items + threadIdx.x * Items + item;
     float score = -CUDART_INF_F;
     unsigned token = UINT_MAX;
     if (index < count) {
@@ -685,7 +685,7 @@ __global__ void compact_candidates_kernel(
     for (unsigned item = 0; item < Items; ++item) {
       const unsigned rank = threadIdx.x * Items + item;
       if (rank < retained)
-        candidates[std::size_t(blockIdx.x) * retained + rank] =
+        candidates[std::size_t(tile) * retained + rank] =
             {scores[item], tokens[item]};
     }
   } else {
@@ -725,6 +725,38 @@ __global__ void compact_candidates_kernel(
       if (rank < retained) output[rank] = {tokens[item], scores[item]};
     }
   }
+}
+
+template <int Items, bool Final>
+__global__ void compact_candidates_kernel(
+    const __nv_bfloat16* logits, const SelectionCandidate* input,
+    unsigned count, float temperature, const std::uint32_t* allowed_tokens,
+    unsigned retained, float top_p, SelectionCandidate* candidates,
+    TokenProbability* output, Status* status) {
+  compact_candidates_body<Items, Final>(logits, input, count, temperature,
+      allowed_tokens, retained, top_p, candidates, output, status, blockIdx.x);
+}
+
+constexpr unsigned kCompactBatchEntries = 32;
+struct CompactCandidateRow {
+  const __nv_bfloat16* logits;
+  const SelectionCandidate* input;
+  SelectionCandidate* next;
+  TokenProbability* output;
+  const std::uint32_t* allowed;
+  Status* status;
+  float temperature, top_p;
+};
+struct CompactCandidateBatch { CompactCandidateRow rows[kCompactBatchEntries]; };
+
+template <int Items, bool Final>
+__global__ void compact_candidates_batch_kernel(
+    const __grid_constant__ CompactCandidateBatch batch,
+    unsigned count, unsigned retained) {
+  const auto& row = batch.rows[blockIdx.y];
+  compact_candidates_body<Items, Final>(row.logits, row.input, count,
+      row.temperature, row.allowed, retained, row.top_p, row.next,
+      row.output, row.status, blockIdx.x);
 }
 
 using CompactReduce = cub::BlockReduce<float, kThreads>;
@@ -1155,6 +1187,73 @@ void build_compact_distribution(
         logits, input, count, temperature, allowed_tokens, row_size, top_p,
         nullptr, output, status);
   check_cuda(cudaGetLastError(), "select and normalize compact MTP top-k");
+}
+
+void build_compact_distributions(
+    const std::vector<CompactDistributionInput>& inputs,
+    std::uint32_t vocabulary_size, cudaStream_t stream) {
+  require(!inputs.empty(), "compact distribution batch must be nonempty");
+  const auto plan = make_plan(vocabulary_size);
+  for (const auto& row : inputs) {
+    check_compact_size(row.row_size, vocabulary_size);
+    require(row.logits && row.output && row.status && row.scratch &&
+                reinterpret_cast<std::uintptr_t>(row.scratch) % kAlignment == 0 &&
+                row.scratch_size >= plan.bytes &&
+                std::isfinite(row.temperature) && row.temperature > 0 &&
+                std::isfinite(row.top_p) && row.top_p > 0 && row.top_p <= 1,
+            "invalid compact batch row inputs/settings/scratch");
+  }
+  for (std::size_t first = 0; first < inputs.size();) {
+    const unsigned retained = inputs[first].row_size;
+    unsigned rows = 1;
+    while (rows < kCompactBatchEntries && first + rows < inputs.size() &&
+           inputs[first + rows].row_size == retained) ++rows;
+    if (rows == 1) {
+      const auto& row = inputs[first++];
+      build_compact_distribution(row.logits, vocabulary_size, row.temperature,
+          row.top_p, retained, row.output, row.scratch, row.scratch_size,
+          row.status, stream, row.allowed_tokens);
+      continue;
+    }
+    CompactCandidateBatch batch{};
+    SelectionCandidate* other[kCompactBatchEntries]{};
+    for (unsigned i = 0; i < rows; ++i) {
+      const auto& row = inputs[first + i];
+      batch.rows[i] = {row.logits, nullptr,
+          at<SelectionCandidate>(row.scratch, plan.scores_in), row.output,
+          row.allowed_tokens, row.status, row.temperature, row.top_p};
+      other[i] = at<SelectionCandidate>(row.scratch, plan.tokens_in);
+    }
+    const auto advance = [&] {
+      for (unsigned i = 0; i < rows; ++i) {
+        batch.rows[i].input = batch.rows[i].next;
+        std::swap(batch.rows[i].next, other[i]);
+      }
+    };
+    unsigned count = vocabulary_size;
+    if (count > 4096) {
+      const unsigned tiles = (count + 1023) / 1024;
+      compact_candidates_batch_kernel<4, false><<<dim3(tiles, rows), kThreads, 0, stream>>>(
+          batch, count, retained);
+      advance();
+      count = tiles * retained;
+    }
+    while (count > 4096) {
+      const unsigned tiles = (count + 4095) / 4096;
+      compact_candidates_batch_kernel<16, false><<<dim3(tiles, rows), kThreads, 0, stream>>>(
+          batch, count, retained);
+      advance();
+      count = tiles * retained;
+    }
+    if (count <= 1024)
+      compact_candidates_batch_kernel<4, true><<<dim3(1, rows), kThreads, 0, stream>>>(
+          batch, count, retained);
+    else
+      compact_candidates_batch_kernel<16, true><<<dim3(1, rows), kThreads, 0, stream>>>(
+          batch, count, retained);
+    check_cuda(cudaGetLastError(), "select and normalize batched compact MTP top-k");
+    first += rows;
+  }
 }
 
 void sample_compact_distribution(

@@ -255,7 +255,6 @@ class PersistentCacheManager::Impl {
     prefix_index::RetentionPriority priority{
         prefix_index::RetentionPriority::normal};
     bool automatic{};
-    bool active{};
   };
 
   struct ColdPage {
@@ -295,7 +294,6 @@ class PersistentCacheManager::Impl {
         cold_page_id_slots_per_checkpoint_(maximum_global_page_count(config_)),
         prefix_index_(prefix_index_bytes(config_)),
         demand_slot_capacity_(demand_slot_capacity(config_)),
-        demand_slots_(std::make_unique<DemandSlot[]>(demand_slot_capacity_)),
         ledger_(ledger_config(config_)),
         physical_(storage_factory(config_, ledger_, page_offsets_count_)),
         events_(std::move(events)),
@@ -316,6 +314,8 @@ class PersistentCacheManager::Impl {
     if (demand_slot_capacity_ == 0) {
       fail("persistent KV cache", "index budget cannot hold an owner demand");
     }
+    // Reserve the bounded storage once; scans visit only populated demands.
+    demand_slots_.reserve(demand_slot_capacity_);
     if (config_.cpu_bytes != 0 &&
         (cold_page_capacity_ == 0 || cold_checkpoint_capacity_ == 0)) {
       fail("persistent KV cache", "index budget cannot hold cold metadata");
@@ -781,9 +781,9 @@ class PersistentCacheManager::Impl {
         continue;
       }
       const bool existing = std::any_of(
-          demand_slots_.get(), demand_slots_.get() + demand_slot_capacity_,
+          demand_slots_.begin(), demand_slots_.end(),
           [checkpoint, owner](const DemandSlot& slot) {
-            return slot.active && !slot.automatic &&
+            return !slot.automatic &&
                    slot.checkpoint == checkpoint && same_owner(slot, owner);
           });
       if (!existing) {
@@ -813,17 +813,17 @@ class PersistentCacheManager::Impl {
           continue;
         }
         const auto existing = std::find_if(
-            demand_slots_.get(), demand_slots_.get() + demand_slot_capacity_,
+            demand_slots_.begin(), demand_slots_.end(),
             [checkpoint, owner](const DemandSlot& slot) {
-              return slot.active && !slot.automatic &&
+              return !slot.automatic &&
                      slot.checkpoint == checkpoint && same_owner(slot, owner);
             });
         active_commit->changes.push_back(
             {checkpoint,
-             existing == demand_slots_.get() + demand_slot_capacity_
+             existing == demand_slots_.end()
                  ? prefix_index::RetentionPriority::normal
                  : existing->priority,
-             existing != demand_slots_.get() + demand_slot_capacity_});
+             existing != demand_slots_.end()});
         if (!add_demand(checkpoint, owner, priority, false,
                         reservation != nullptr)) {
           fail("persistent KV demand",
@@ -851,19 +851,20 @@ class PersistentCacheManager::Impl {
     }
     for (const OwnerDemandCommit::Change& change : commit->changes) {
       const auto found = std::find_if(
-          demand_slots_.get(), demand_slots_.get() + demand_slot_capacity_,
+          demand_slots_.begin(), demand_slots_.end(),
           [&change, owner](const DemandSlot& slot) {
-            return slot.active && !slot.automatic &&
+            return !slot.automatic &&
                    slot.checkpoint == change.checkpoint &&
                    same_owner(slot, owner);
           });
-      if (found == demand_slots_.get() + demand_slot_capacity_) {
+      if (found == demand_slots_.end()) {
         continue;
       }
       if (change.existed) {
         found->priority = change.previous_priority;
       } else {
-        found->active = false;
+        *found = std::move(demand_slots_.back());
+        demand_slots_.pop_back();
       }
     }
     for (const OwnerDemandCommit::Change& change : commit->changes) {
@@ -914,16 +915,18 @@ class PersistentCacheManager::Impl {
     if (owner.empty()) {
       return;
     }
-    // Each (owner, checkpoint) pair occupies at most one fixed demand slot.
-    // Reclaim it immediately after clearing the slot, avoiding a temporary
+    // Each (owner, checkpoint) pair occupies at most one demand slot.
+    // Reclaim it immediately after removing the slot, avoiding a temporary
     // vector when a finished streaming request releases its owner.
-    for (std::size_t index = 0; index < demand_slot_capacity_; ++index) {
-      DemandSlot& slot = demand_slots_[index];
-      if (!slot.active || slot.automatic || !same_owner(slot, owner)) {
+    for (std::size_t index = 0; index < demand_slots_.size();) {
+      const DemandSlot& slot = demand_slots_[index];
+      if (slot.automatic || !same_owner(slot, owner)) {
+        ++index;
         continue;
       }
       const kv_cache::CheckpointId checkpoint = slot.checkpoint;
-      slot.active = false;
+      demand_slots_[index] = std::move(demand_slots_.back());
+      demand_slots_.pop_back();
       refresh_priority(checkpoint);
       reclaim_if_undemanded(checkpoint);
     }
@@ -1537,8 +1540,7 @@ class PersistentCacheManager::Impl {
     auto admission = prefix_index_.admit(checkpoint, tokens, source, eligible, images);
     while (!admission.retained()) {
       if (admission.status == prefix_index::AdmissionStatus::protected_periodic ||
-          !ledger_.evict_idle_checkpoint(
-              checkpoint, kv_cache::EvictionCause::index_pressure)) {
+          !reclaim_prefix_index(checkpoint)) {
         emit_checkpoint_rejection(
             checkpoint, tokens.size(), source,
             admission.status == prefix_index::AdmissionStatus::protected_periodic
@@ -2054,9 +2056,7 @@ class PersistentCacheManager::Impl {
   }
 
   [[nodiscard]] std::size_t active_demand_count() const {
-    return static_cast<std::size_t>(std::count_if(
-        demand_slots_.get(), demand_slots_.get() + demand_slot_capacity_,
-        [](const DemandSlot& slot) { return slot.active; }));
+    return demand_slots_.size();
   }
 
   [[nodiscard]] static bool same_owner(const DemandSlot& slot,
@@ -2066,10 +2066,9 @@ class PersistentCacheManager::Impl {
   }
 
   [[nodiscard]] bool has_demand(kv_cache::CheckpointId checkpoint) const {
-    return std::any_of(demand_slots_.get(),
-                       demand_slots_.get() + demand_slot_capacity_,
+    return std::any_of(demand_slots_.begin(), demand_slots_.end(),
                        [checkpoint](const DemandSlot& slot) {
-                         return slot.active && slot.checkpoint == checkpoint;
+                         return slot.checkpoint == checkpoint;
                        });
   }
 
@@ -2084,15 +2083,7 @@ class PersistentCacheManager::Impl {
                   : owner.empty() || owner.size() > kMaximumCacheOwnerBytes) {
       fail("persistent KV demand", "owner demand is malformed");
     }
-    DemandSlot* free_slot = nullptr;
-    for (std::size_t index = 0; index < demand_slot_capacity_; ++index) {
-      DemandSlot& slot = demand_slots_[index];
-      if (!slot.active) {
-        if (free_slot == nullptr) {
-          free_slot = &slot;
-        }
-        continue;
-      }
+    for (DemandSlot& slot : demand_slots_) {
       if (slot.checkpoint == checkpoint && slot.automatic == automatic &&
           (automatic || same_owner(slot, owner))) {
         if (!automatic || static_cast<unsigned>(priority) >
@@ -2104,29 +2095,27 @@ class PersistentCacheManager::Impl {
       }
     }
     const std::size_t free_slots = demand_slot_capacity_ - active_demand_count();
-    if (free_slot == nullptr ||
+    if (free_slots == 0 ||
         (!consume_reserved_slot && free_slots <= reserved_owner_demand_slots_)) {
       return false;
     }
-    free_slot->checkpoint = checkpoint;
-    free_slot->owner_bytes = static_cast<std::uint8_t>(owner.size());
-    free_slot->priority = priority;
-    free_slot->automatic = automatic;
-    free_slot->active = true;
+    demand_slots_.emplace_back();
+    DemandSlot& slot = demand_slots_.back();
+    slot.checkpoint = checkpoint;
+    slot.owner_bytes = static_cast<std::uint8_t>(owner.size());
+    slot.priority = priority;
+    slot.automatic = automatic;
     if (!automatic) {
-      std::copy(owner.begin(), owner.end(), free_slot->owner.begin());
+      std::copy(owner.begin(), owner.end(), slot.owner.begin());
     }
     refresh_priority(checkpoint);
     return true;
   }
 
   void discard_demands(kv_cache::CheckpointId checkpoint) {
-    for (std::size_t index = 0; index < demand_slot_capacity_; ++index) {
-      DemandSlot& slot = demand_slots_[index];
-      if (slot.active && slot.checkpoint == checkpoint) {
-        slot.active = false;
-      }
-    }
+    demand_slots_.erase(std::remove_if(demand_slots_.begin(), demand_slots_.end(),
+        [checkpoint](const DemandSlot& slot) { return slot.checkpoint == checkpoint; }),
+        demand_slots_.end());
   }
 
   void refresh_priority(kv_cache::CheckpointId checkpoint) {
@@ -2136,9 +2125,8 @@ class PersistentCacheManager::Impl {
     prefix_index::RetentionPriority strongest =
         prefix_index::RetentionPriority::low;
     bool found = false;
-    for (std::size_t index = 0; index < demand_slot_capacity_; ++index) {
-      const DemandSlot& slot = demand_slots_[index];
-      if (!slot.active || slot.checkpoint != checkpoint) {
+    for (const DemandSlot& slot : demand_slots_) {
+      if (slot.checkpoint != checkpoint) {
         continue;
       }
       if (!found || static_cast<unsigned>(slot.priority) >
@@ -2706,6 +2694,29 @@ class PersistentCacheManager::Impl {
     return bytes;
   }
 
+  [[nodiscard]] bool reclaim_prefix_index(
+      kv_cache::CheckpointId protected_checkpoint) {
+    // Spilling frees ledger/GPU storage but keeps the trie entry. Index
+    // admission must instead remove idle retained state, in either tier.
+    const auto victim = prefix_index_.select_clock_victim(
+        [this, protected_checkpoint](auto checkpoint) {
+          return checkpoint != protected_checkpoint &&
+                 checkpoint != cold_reservation_checkpoint_ &&
+                 checkpoint_idle(checkpoint);
+        },
+        [this](auto checkpoint) {
+          return ledger_.has_checkpoint(checkpoint)
+              ? checkpoint_reclaimable_gpu_bytes(checkpoint)
+              : cold_checkpoint_bytes(*find_cold(checkpoint));
+        });
+    if (!victim) return false;
+    if (ledger_.has_checkpoint(*victim))
+      release_hot_checkpoint(*victim, "prefix_index_pressure");
+    else
+      discard_cold(*victim, "prefix_index_pressure");
+    return true;
+  }
+
   [[nodiscard]] kv_cache::CheckpointId select_pressure_victim(
       const std::vector<kv_cache::CheckpointId>& eligible,
       kv_cache::EvictionCause cause) {
@@ -2774,7 +2785,7 @@ class PersistentCacheManager::Impl {
   std::size_t cold_page_id_slots_per_checkpoint_{};
   prefix_index::PrefixIndex prefix_index_;
   std::size_t demand_slot_capacity_{};
-  std::unique_ptr<DemandSlot[]> demand_slots_;
+  std::vector<DemandSlot> demand_slots_;
   std::size_t reserved_owner_demand_slots_{};
   kv_cache::CacheLedger ledger_;
   std::unique_ptr<CacheStorage> physical_;

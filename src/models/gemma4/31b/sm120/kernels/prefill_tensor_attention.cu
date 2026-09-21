@@ -60,7 +60,7 @@ __global__ void gather_tensor_attention_tile_kernel(
     const BFloat16* value_cache, std::uint32_t base_position,
     std::uint32_t token_count, std::uint32_t cache_capacity,
     std::uint32_t tile_start,
-    std::uint32_t tile_count, BFloat16* staged_key,
+    std::uint32_t tile_count, std::uint32_t staged_count, BFloat16* staged_key,
     BFloat16* staged_value, std::size_t elements, kv_cache::Format format) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -72,9 +72,19 @@ __global__ void gather_tensor_attention_tile_kernel(
       static_cast<std::uint32_t>(index % HeadSize);
   const std::size_t row = index / HeadSize;
   const std::uint32_t tile_position =
-      static_cast<std::uint32_t>(row % tile_count);
+      static_cast<std::uint32_t>(row % staged_count);
   const std::uint32_t kv_head =
-      static_cast<std::uint32_t>(row / tile_count);
+      static_cast<std::uint32_t>(row / staged_count);
+  const std::size_t staged_index =
+      (static_cast<std::size_t>(kv_head) * kTensorAttentionTileTokens +
+       tile_position) * HeadSize + dimension;
+  // Padded keys are not history: do not read current K/V or a wrapped ring
+  // slot for them. Both operands must be finite even with zero probability.
+  if (tile_position >= tile_count) {
+    staged_key[staged_index] = __float2bfloat16_rn(0.0F);
+    staged_value[staged_index] = __float2bfloat16_rn(0.0F);
+    return;
+  }
   const std::uint32_t absolute_position = tile_start + tile_position;
   const bool current = absolute_position >= base_position;
   const std::uint32_t current_position =
@@ -93,12 +103,6 @@ __global__ void gather_tensor_attention_tile_kernel(
       dimension;
   const std::size_t cache_index =
       (static_cast<std::size_t>(kv_head) * cache_capacity + cache_position) *
-          HeadSize +
-      dimension;
-  const std::size_t staged_index =
-      (static_cast<std::size_t>(kv_head) *
-           kTensorAttentionTileTokens +
-       tile_position) *
           HeadSize +
       dimension;
   staged_key[staged_index] =
@@ -238,7 +242,8 @@ __global__ void tensor_attention_softmax_update_kernel(
     float* row_maximum, float* row_denominator,
     std::uint32_t base_position, std::uint32_t token_count,
     std::uint32_t tile_start, std::uint32_t tile_count, bool first_tile,
-    const float* query_scales, const float* key_scales) {
+    const float* query_scales, const float* key_scales,
+    const float* value_token_scales = nullptr, const float* value_output_scales = nullptr) {
   static_assert(HeadSize <= kTensorAttentionMaximumHeadSize);
   // One warp owns a row: eight rows share a CTA, and all reductions and
   // scores stay in registers. No communication between warps is needed.
@@ -309,16 +314,28 @@ __global__ void tensor_attention_softmax_update_kernel(
     const unsigned position = lane + i * kWarpSize;
     const float exponential = values[i] == negative_infinity ? 0.0F : expf(values[i] - next_maximum);
     if constexpr (Fp8) {
-      const auto weight = __nv_cvt_float_to_fp8(exponential * 256.0F, __NV_SATFINITE, __NV_E4M3);
-      const auto half = __nv_cvt_fp8_to_halfraw(weight, __NV_E4M3);
-      sums[i % kWarpsPerBlock] += __half2float(static_cast<__half>(half)) / 256.0F;
+      constexpr unsigned KvHeads = Local ? 16 : 4;
+      const unsigned kv_head = query_head / (32 / KvHeads);
+      const float scaled = value_token_scales
+          ? exponential * value_token_scales[kv_head * kTensorAttentionTileTokens + position] /
+                value_output_scales[kv_head * HeadSize]
+          : exponential * 256.0F;
+      const auto weight = __nv_cvt_float_to_fp8(scaled, __NV_SATFINITE, __NV_E4M3);
+      if (value_token_scales) sums[i % kWarpsPerBlock] += exponential;
+      else {
+        const auto half = __nv_cvt_fp8_to_halfraw(weight, __NV_E4M3);
+        sums[i % kWarpsPerBlock] += __half2float(static_cast<__half>(half)) / 256.0F;
+      }
       // Native P*V contracts the full padded tile. Masked/future entries must
       // be explicitly zero even when tile_count is not a multiple of 16.
       reinterpret_cast<unsigned char*>(probabilities)[tile_row + position] = weight;
     } else {
       const auto weight = __float2bfloat16_rn(exponential);
       sums[i % kWarpsPerBlock] += __bfloat162float(weight);
-      if (position < tile_count) probabilities[tile_row + position] = weight;
+      // Local BF16 GEMMs round the key width to eight. Visibility and the
+      // denominator still use the real tile_count; padded probabilities are 0.
+      const unsigned stored_columns = Local ? (tile_count + 7U) / 8U * 8U : tile_count;
+      if (position < stored_columns) probabilities[tile_row + position] = weight;
     }
   }
 #pragma unroll
@@ -406,11 +423,11 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
   // without increasing its local padded matmul work.
   const std::uint32_t query_tile_rows = fp8 ? 512 : 256;
   // Local slices shrink the sliding-window union. Global slices bound the
-  // score/probability working set, but a partial slice adds another full-history
-  // gather pass. Keep global slicing to complete tiles that amortize packing.
+  // score/probability working set, including ragged BF16 chunks. FP8 retains
+  // its existing complete-tile gate to amortize the extra packing passes.
   constexpr std::uint32_t kSlicedMinimumRows = 768;
   const bool slice_queries = token_count >= kSlicedMinimumRows &&
-      (Local || token_count % 256 == 0);
+      (Local || !fp8 || token_count % 256 == 0);
   const std::uint32_t query_capacity =
       slice_queries ? query_tile_rows : token_count;
   const TensorAttentionScratchLayout scratch_layout(query_capacity);
@@ -462,14 +479,19 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
     for (std::uint32_t tile_start = visible_begin; tile_start < visible_end;) {
       const std::uint32_t tile_count =
           std::min(kTensorAttentionTileTokens, visible_end - tile_start);
+      const std::uint32_t staged_count =
+          Local && !fp8 ? (tile_count + 7U) / 8U * 8U : tile_count;
       const std::size_t staged_elements =
-          static_cast<std::size_t>(KvHeads) * tile_count * HeadSize;
+          static_cast<std::size_t>(KvHeads) * staged_count * HeadSize;
+      const bool direct_cache = fp8 && format == kv_cache::Format::fp8 &&
+          CacheLayout != TensorCacheLayout::separate;
+      if (!direct_cache) {
       if constexpr (CacheLayout == TensorCacheLayout::separate) {
         gather_tensor_attention_tile_kernel<HeadSize, KvHeads, Local>
             <<<blocks_for(staged_elements), kThreads, 0, stream>>>(
                 current_key_head_major, current_value_token_major, key_cache,
                 value_cache, base_position, token_count, cache_capacity,
-                tile_start, tile_count, staged_key, staged_value,
+                tile_start, tile_count, staged_count, staged_key, staged_value,
                 staged_elements, format);
       } else if constexpr (CacheLayout == TensorCacheLayout::compact_global) {
         gather_tensor_attention_tile_global_compact_kernel
@@ -490,6 +512,7 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
       }
       check_cuda(cudaGetLastError(),
                  "tensor attention K/V gather kernel launch");
+      }
 
       constexpr int kInner = static_cast<int>(HeadSize);
       const int grouped_rows = static_cast<int>(kRepeats * query_count);
@@ -505,11 +528,17 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
       const long long numerator_group_stride =
           static_cast<long long>(kRepeats) * query_count *
           kTensorAttentionMaximumHeadSize;
-      const int tile_columns = static_cast<int>(tile_count);
+      const int tile_columns = static_cast<int>(staged_count);
       const float alpha = 1.0F;
       const float score_beta = 0.0F;
       if (fp8) {
-        fp8->qk(staged_key, staged_value, tile_count, scores, stream);
+        if (direct_cache) {
+          const CompactGlobalPagedCache contiguous{const_cast<BFloat16*>(key_cache),
+              nullptr, cache_capacity, 0, 0, 0, format};
+          fp8->qk_compact(current_key_head_major, current_value_token_major,
+              paged_cache ? *paged_cache : contiguous, global_k_norm_scale,
+              base_position, token_count, tile_start, tile_count, scores, stream);
+        } else fp8->qk(staged_key, staged_value, tile_count, scores, stream);
       } else check_cublas(
           cublasGemmStridedBatchedEx(
               handle, CUBLAS_OP_T, CUBLAS_OP_N, tile_columns, grouped_rows,
@@ -528,7 +557,8 @@ void causal_gqa_attention_cached_chunk_tensor_impl(
             <<<state_grid, kThreads, 0, stream>>>(
                 scores, probabilities, numerator, row_maximum, row_denominator,
                 query_base, query_count, tile_start, tile_count, first_tile,
-                fp8->query_scales(), fp8->key_scales());
+                fp8->query_scales(), fp8->key_scales(), fp8->value_token_scales(),
+                fp8->value_output_scales());
       } else tensor_attention_softmax_update_kernel<HeadSize, Local>
           <<<state_grid, kThreads, 0, stream>>>(
               scores, probabilities, numerator, row_maximum, row_denominator,

@@ -2,7 +2,7 @@
 
 #include "gewell/attention_compute.h"
 
-#include "gewell/kv_format.h"
+#include "gewell/kv_cache.h"
 
 #include "gewell/nvfp4_policy.h"
 #include "gewell/models/gemma4/31b/sm120/execution_config.h"
@@ -26,13 +26,14 @@ struct RuntimeSettings {
   // Zero disables MTP. Positive values select fixed-depth MTP.
   std::uint32_t mtp_depth{};
   std::uint32_t prefill_chunk_tokens{gemma4_31b::sm120::kDefaultPrefillChunkTokens};
+  std::uint32_t prefill_budget_tokens{};
   // All cache sizes are MiB. The GPU budget is deliberately required for the
   // persistent serving path; the remaining values have the documented
   // engineering defaults.
   std::uint64_t kv_cache_gpu_mib{};
   std::uint64_t kv_cache_cpu_mib{};
   std::uint64_t kv_checkpoint_interval_tokens{8'192};
-  std::uint64_t kv_cache_index_mib{64};
+  std::uint64_t kv_cache_index_mib{kv_cache::kDefaultIndexBytes / kv_cache::kMib};
 };
 
 struct GenerationSettings {
@@ -45,6 +46,7 @@ struct GenerationSettings {
   nvfp4::ActivationPolicy nvfp4_activation_policy{nvfp4::ActivationPolicy::always};
   std::uint32_t mtp_depth{};
   std::uint32_t prefill_chunk_tokens{gemma4_31b::sm120::kDefaultPrefillChunkTokens};
+  std::uint32_t prefill_budget_tokens{};
   float temperature{};
   float top_p{1.0F};
   std::uint32_t top_k{};
@@ -85,7 +87,8 @@ int run_generate_batch(const std::string& artifact_path,
                        attention::Compute local_attention_compute = attention::Compute::bf16,
                        attention::Compute global_attention_compute = attention::Compute::bf16,
                        const std::string& assistant_path = {},
-                       const std::string& vision_path = {});
+                       const std::string& vision_path = {},
+                       std::uint32_t prefill_budget_tokens = 0);
 
 // Native HTTP uses the same scheduler directly, with one GPU owner.
 int run_http_server(const std::string& model_directory,

@@ -370,69 +370,87 @@ void test_qkv_norm_fusion(std::ostream& report) {
 }
 
 void test_qkv_rope_batch(std::ostream& report) {
+  std::vector<unsigned> ragged;
+  for (unsigned i = 0; i < 37; ++i)
+    ragged.push_back(i == 0 ? 33 : i == 36 ? 1280 : 1 + i % 9);
+  const std::vector<std::vector<unsigned>> cases{
+      {1}, {4}, {31}, {32}, {33}, {1280}, {31, 32}, {32, 32},
+      std::vector<unsigned>(32, 4), ragged};
   for (const bool global : {false, true}) {
-    const auto kind = global ? gemma4_31b::AttentionKind::global : gemma4_31b::AttentionKind::local;
-    const unsigned d = global ? 512 : 256, heads = global ? 4 : 16;
-    const unsigned qw = 32 * d, kw = heads * d, width = qw + (global ? kw : 2 * kw);
-    std::vector<unsigned> counts;
-    unsigned rows = 0;
-    for (unsigned i = 0; i < 37; ++i) {
-      counts.push_back(i == 0 ? 33 : i == 36 ? 1280 : 1 + i % 9);
-      rows += counts.back();
+    for (const auto& counts : cases) {
+      const auto kind = global ? gemma4_31b::AttentionKind::global : gemma4_31b::AttentionKind::local;
+      const unsigned d = global ? 512 : 256, heads = global ? 4 : 16;
+      const unsigned qw = 32 * d, kw = heads * d, width = qw + (global ? kw : 2 * kw);
+      unsigned rows = 0;
+      for (const auto count : counts) rows += count;
+      report << "QKV/RoPE kind=" << (global ? "global" : "local")
+             << " requests=" << counts.size() << " total_rows=" << rows << '\n';
+      DeviceBuffer<BFloat16> input(std::size_t(rows) * width), cosine(rows * d), sine(rows * d);
+      DeviceBuffer<BFloat16> qwgt(d), kwgt(d), qn(rows * qw), kn(rows * kw);
+      // One guard on each side of every request, with only BF16 alignment.
+      const std::vector<BFloat16> qguards(rows * qw + 2 * counts.size(), to_bf16(-17));
+      const std::vector<BFloat16> kvguards(rows * kw + 2 * counts.size(), to_bf16(-19));
+      DeviceBuffer<BFloat16> qr(qguards.size()), kr(kvguards.size()), vr(kvguards.size());
+      DeviceBuffer<BFloat16> qo(qguards.size()), ko(kvguards.size()), vo(kvguards.size());
+      std::vector<QkvRopeInput> inputs;
+      unsigned first = 0;
+      for (const auto count : counts) {
+        const auto guard_offset = 2 * inputs.size() + 1;
+        inputs.push_back({input.get() + first * width, cosine.get() + first * d,
+            sine.get() + first * d, qo.get() + first * qw + guard_offset,
+            ko.get() + first * kw + guard_offset, vo.get() + first * kw + guard_offset, count});
+        first += count;
+      }
+      cudaStream_t stream;
+      cudaGraph_t graph;
+      cudaGraphExec_t exec;
+      check_cuda(cudaStreamCreate(&stream), "batched QKV stream");
+      check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "batched QKV capture");
+      qkv_rms_rope_batch(inputs, qwgt.get(), kwgt.get(), kind, stream);
+      check_cuda(cudaStreamEndCapture(stream, &graph), "batched QKV capture end");
+      check_cuda(cudaGraphInstantiate(&exec, graph, 0), "batched QKV instantiate");
+      for (unsigned replay = 0; replay < 2; ++replay) {
+        auto raw = pattern(std::size_t(rows) * width, 97 + 2 * replay, 48, 0.0625F);
+        for (std::size_t i = 0; i < raw.size(); i += 17)
+          raw[i] = to_bf16(std::ldexp(to_float(raw[i]), int((i / 17) % 21) - 10));
+        std::fill(raw.begin(), raw.begin() + d, to_bf16(0));
+        raw[d + 17] = to_bf16(512.0F);
+        input.copy_from(raw);
+        cosine.copy_from(pattern(rows * d, 31 + 2 * replay, 15, 0.0625F));
+        sine.copy_from(pattern(rows * d, 29 + 2 * replay, 14, 0.0625F));
+        qwgt.copy_from(pattern(d, 17 + 2 * replay, 5, 0.125F));
+        kwgt.copy_from(pattern(d, 13 + 2 * replay, 3, 0.25F));
+        qo.copy_from(qguards); ko.copy_from(kvguards); vo.copy_from(kvguards);
+        qr.copy_from(qguards); kr.copy_from(kvguards); vr.copy_from(kvguards);
+        first = 0;
+        for (unsigned request = 0; request < counts.size(); ++request) {
+          const auto count = counts[request], guard_offset = 2 * request + 1;
+          qkv_rms_norm(input.get() + first * width, qwgt.get(), kwgt.get(),
+              qn.get() + first * qw, kn.get() + first * kw,
+              vr.get() + first * kw + guard_offset, count, kind);
+          prefill_primitives::apply_rope_transpose_chunk(qn.get() + first * qw,
+              cosine.get() + first * d, sine.get() + first * d,
+              qr.get() + first * qw + guard_offset, 32, count, kind);
+          prefill_primitives::apply_rope_transpose_chunk(kn.get() + first * kw,
+              cosine.get() + first * d, sine.get() + first * d,
+              kr.get() + first * kw + guard_offset, heads, count, kind);
+          first += count;
+        }
+        check_cuda(cudaDeviceSynchronize(), "batched QKV reference");
+        check_cuda(cudaGraphLaunch(exec, stream), "batched QKV replay");
+        check_cuda(cudaStreamSynchronize(stream), "batched QKV synchronize");
+        report_metric(report, "batched_q_rope", measure(qo.copy_to_host(), qr.copy_to_host()), 0, true);
+        report_metric(report, "batched_k_rope", measure(ko.copy_to_host(), kr.copy_to_host()), 0, true);
+        report_metric(report, "batched_v_norm", measure(vo.copy_to_host(), vr.copy_to_host()), 0, true);
+        report_metric(report, "batched_qkv_input_unchanged", measure(input.copy_to_host(), raw), 0, true);
+      }
+      inputs.back().rows = 0;
+      bool rejected = false;
+      try { qkv_rms_rope_batch(inputs, qwgt.get(), kwgt.get(), kind, stream); }
+      catch (const std::runtime_error&) { rejected = true; }
+      if (!rejected) fail("batched QKV", "accepted invalid last request");
+      cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
     }
-    DeviceBuffer<BFloat16> input(std::size_t(rows) * width), cosine(rows * d), sine(rows * d);
-    DeviceBuffer<BFloat16> qwgt(d), kwgt(d), qn(rows * qw), kn(rows * kw);
-    DeviceBuffer<BFloat16> qr(rows * qw), kr(rows * kw), vr(rows * kw);
-    DeviceBuffer<BFloat16> qo(rows * qw), ko(rows * kw), vo(rows * kw);
-    auto raw = pattern(std::size_t(rows) * width, 97, 48, 0.0625F);
-    for (std::size_t i = 0; i < raw.size(); i += 17)
-      raw[i] = to_bf16(std::ldexp(to_float(raw[i]), int((i / 17) % 21) - 10));
-    std::fill(raw.begin(), raw.begin() + d, to_bf16(0));
-    raw[d + 17] = to_bf16(512.0F);
-    input.copy_from(raw);
-    cosine.copy_from(pattern(rows * d, 31, 15, 0.0625F));
-    sine.copy_from(pattern(rows * d, 29, 14, 0.0625F));
-    qwgt.copy_from(pattern(d, 17, 5, 0.125F));
-    kwgt.copy_from(pattern(d, 13, 3, 0.25F));
-    std::vector<QkvRopeInput> inputs;
-    unsigned first = 0;
-    for (const auto count : counts) {
-      qkv_rms_norm(input.get() + first * width, qwgt.get(), kwgt.get(),
-          qn.get() + first * qw, kn.get() + first * kw, vr.get() + first * kw, count, kind);
-      prefill_primitives::apply_rope_transpose_chunk(qn.get() + first * qw,
-          cosine.get() + first * d, sine.get() + first * d, qr.get() + first * qw, 32, count, kind);
-      prefill_primitives::apply_rope_transpose_chunk(kn.get() + first * kw,
-          cosine.get() + first * d, sine.get() + first * d, kr.get() + first * kw, heads, count, kind);
-      inputs.push_back({input.get() + first * width, cosine.get() + first * d,
-          sine.get() + first * d, qo.get() + first * qw, ko.get() + first * kw,
-          vo.get() + first * kw, count});
-      first += count;
-    }
-    check_cuda(cudaDeviceSynchronize(), "batched QKV reference");
-    cudaStream_t stream;
-    cudaGraph_t graph;
-    cudaGraphExec_t exec;
-    check_cuda(cudaStreamCreate(&stream), "batched QKV stream");
-    check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "batched QKV capture");
-    qkv_rms_rope_batch(inputs, qwgt.get(), kwgt.get(), kind, stream);
-    // Single-request prefill dispatch, including 33 rows and a chunk wider
-    // than the default cap, must retain the separate recipe.
-    qkv_rms_rope_batch({inputs.front()}, qwgt.get(), kwgt.get(), kind, stream);
-    qkv_rms_rope_batch({inputs.back()}, qwgt.get(), kwgt.get(), kind, stream);
-    check_cuda(cudaStreamEndCapture(stream, &graph), "batched QKV capture end");
-    check_cuda(cudaGraphInstantiate(&exec, graph, 0), "batched QKV instantiate");
-    for (unsigned replay = 0; replay < 2; ++replay)
-      check_cuda(cudaGraphLaunch(exec, stream), "batched QKV replay");
-    check_cuda(cudaStreamSynchronize(stream), "batched QKV synchronize");
-    report_metric(report, "batched_q_rope", measure(qo.copy_to_host(), qr.copy_to_host()), 0, true);
-    report_metric(report, "batched_k_rope", measure(ko.copy_to_host(), kr.copy_to_host()), 0, true);
-    report_metric(report, "batched_v_norm", measure(vo.copy_to_host(), vr.copy_to_host()), 0, true);
-    inputs.back().rows = 0;
-    bool rejected = false;
-    try { qkv_rms_rope_batch(inputs, qwgt.get(), kwgt.get(), kind, stream); }
-    catch (const std::runtime_error&) { rejected = true; }
-    if (!rejected) fail("batched QKV", "accepted invalid last request");
-    cudaGraphExecDestroy(exec); cudaGraphDestroy(graph); cudaStreamDestroy(stream);
   }
 }
 
@@ -4661,7 +4679,20 @@ bool run_self_tests(std::ostream& report, std::string* failure) {
 }  // namespace
 }  // namespace gewell::bf16_primitives
 
-int main() {
+int main(int argc, char** argv) {
+  if (argc == 2 && std::string_view(argv[1]) == "--qkv-rope") {
+    try {
+      gewell::bf16_primitives::test_qkv_rope_batch(std::cout);
+      return 0;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc != 1) {
+    std::cerr << "usage: gewell_bf16_primitives_test [--qkv-rope]\n";
+    return 1;
+  }
   std::string failure;
   if (!gewell::bf16_primitives::run_self_tests(std::cout, &failure)) {
     std::cerr << failure << "\n";

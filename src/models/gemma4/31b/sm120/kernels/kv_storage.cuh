@@ -25,11 +25,36 @@ __device__ __forceinline__ BF16 load(const BF16* record, unsigned d,
   return __float2bfloat16_rn(__half2float(static_cast<__half>(half)) * scale);
 }
 
+__device__ __forceinline__ uint4 unpack_eight(uint2 packed, float scale) {
+  uint4 result;
+  auto* pairs = reinterpret_cast<__nv_bfloat162*>(&result);
+#pragma unroll
+  for (unsigned i = 0; i < 4; ++i) {
+    const unsigned word = i < 2 ? packed.x : packed.y;
+    const auto half = __nv_cvt_fp8x2_to_halfraw2(
+        static_cast<__nv_fp8x2_storage_t>(word >> ((i % 2) * 16)), __NV_E4M3);
+    const auto values = __half22float2(static_cast<__half2>(half));
+    // Keep the scalar reader's FP32 scaling and final BF16 rounding.
+    pairs[i] = __float22bfloat162_rn(
+        make_float2(values.x * scale, values.y * scale));
+  }
+  return result;
+}
+
 __device__ __forceinline__ uint4 load_eight(const BF16* record, unsigned d,
     unsigned elements, Format format, unsigned split = 0) {
   if (format == Format::bf16 &&
       !(reinterpret_cast<std::uintptr_t>(record + d) & 15U))
     return *reinterpret_cast<const uint4*>(record + d);
+  const auto* bytes = reinterpret_cast<const unsigned char*>(record);
+  if (format == Format::fp8 &&
+      !(reinterpret_cast<std::uintptr_t>(bytes + d) & 7U) &&
+      !(split && d < split && d + 8 > split)) {
+    const auto packed = *reinterpret_cast<const uint2*>(bytes + d);
+    const float scale = reinterpret_cast<const float*>(bytes + elements)
+        [split && d >= split ? 1 : 0];
+    return unpack_eight(packed, scale);
+  }
   uint4 result;
   auto* values = reinterpret_cast<BF16*>(&result);
 #pragma unroll

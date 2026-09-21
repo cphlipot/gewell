@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gewell/compact_global_cache.h"
+#include "gewell/attention_compute.h"
 
 #include <cublasLt.h>
 #include <cuda_bf16.h>
@@ -74,7 +75,9 @@ class Executor final {
  public:
   explicit Executor(cublasLtHandle_t handle, const Weights& weights,
                     std::uint32_t context_capacity = 262'144,
-                    std::uint32_t batch_capacity = 1);
+                    std::uint32_t batch_capacity = 1,
+                    attention::Compute local_compute = attention::Compute::bf16,
+                    attention::Compute global_compute = attention::Compute::bf16);
   ~Executor();
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;

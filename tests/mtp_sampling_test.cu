@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -1005,6 +1006,109 @@ void compact_distribution_tests() {
   std::cout << "mtp_compact_distribution: full_vocab_partial_tiles_masks_ties_cdf_logprobs_ok\n";
 }
 
+void compact_batch_tests() {
+  constexpr unsigned count = 33, stride = mtp::kMaxCompactTopK + 2;
+  for (unsigned vocabulary : {7U, 1025U, 4097U, 262144U}) {
+    const auto bytes = mtp::scratch_bytes(vocabulary);
+    const auto scratch_stride = bytes + 256;
+    Device<unsigned char> scratch(count * scratch_stride);
+    Device<__nv_bfloat16> logits(std::size_t(count) * vocabulary);
+    Device<unsigned> masks(count * mtp::mask_words(vocabulary));
+    Device<mtp::TokenProbability> reference(count * stride), actual(count * stride);
+    Device<mtp::Status> ref_status(count), status(count);
+    std::vector<mtp::TokenProbability> guarded(count * stride, {UINT32_MAX, -123.0F});
+    cudaStream_t stream;
+    check_cuda(cudaStreamCreate(&stream), "create compact batch stream");
+    for (unsigned mode = 0; mode < 4; ++mode) {
+      std::vector<__nv_bfloat16> values(std::size_t(count) * vocabulary);
+      std::vector<unsigned> allowed(count * mtp::mask_words(vocabulary), 0);
+      for (unsigned row = 0; row < count; ++row) {
+        for (unsigned token = 0; token < vocabulary; ++token)
+          values[std::size_t(row) * vocabulary + token] = __float2bfloat16(
+              mode == 1 ? -0.0F : float(int((token * 2654435761U + row * 97) % 113) - 56) / 8);
+        for (unsigned token : {2U, vocabulary / 2, vocabulary - 1})
+          allowed[row * mtp::mask_words(vocabulary) + token / 32] |= 1U << (token % 32);
+      }
+      if (mode == 2) {
+        std::fill_n(allowed.begin() + mtp::mask_words(vocabulary), mtp::mask_words(vocabulary), 0);
+        values.back() = __float2bfloat16(std::numeric_limits<float>::infinity());
+      }
+      logits.put(values); masks.put(allowed);
+      reference.put(guarded); actual.put(guarded);
+      auto statuses = std::vector<mtp::Status>(count, mtp::Status::success);
+      if (mode == 2) statuses[3] = mtp::Status::invalid_uniform;
+      ref_status.put(statuses); status.put(statuses);
+      check_cuda(cudaMemset(scratch.get(), 0xa5, count * scratch_stride), "guard compact scratch");
+      std::vector<mtp::CompactDistributionInput> batch;
+      for (unsigned row = 0; row < count; ++row) {
+        const unsigned size = std::min(vocabulary, mode == 3
+            ? (row % 2 ? 40U : 256U) : (mode == 0 || row >= 16 ? 40U : 256U));
+        const float temperature = 0.5F + float(row % 5) / 8;
+        const float top_p = row % 3 == 0 ? 1.0F : row % 3 == 1 ? 0.5F : 0.95F;
+        const auto* mask = (row % 2 || mode == 2) ? masks.get() + row * mtp::mask_words(vocabulary) : nullptr;
+        mtp::build_compact_distribution(logits.get() + std::size_t(row) * vocabulary,
+            vocabulary, temperature, top_p, size, reference.get() + row * stride + 1,
+            scratch.get() + row * scratch_stride, bytes, ref_status.get() + row, stream, mask);
+        batch.push_back({logits.get() + std::size_t(row) * vocabulary,
+            temperature, top_p, size, actual.get() + row * stride + 1,
+            scratch.get() + row * scratch_stride, bytes, status.get() + row, mask});
+      }
+      check_cuda(cudaStreamSynchronize(stream), "finish compact row reference");
+      mtp::build_compact_distributions(batch, vocabulary, stream);
+      check_cuda(cudaStreamSynchronize(stream), "finish compact batch");
+      const auto compare = [&] {
+        const auto expected = reference.read(count * stride), observed = actual.read(count * stride);
+        expect(std::memcmp(expected.data(), observed.data(), expected.size() * sizeof(expected[0])) == 0,
+               "compact batch differs from serial rows or overwrites output guards");
+        expect(ref_status.read(count) == status.read(count), "compact batch sticky statuses differ");
+      };
+      compare();
+      if (mode == 2) {
+        const auto observed = status.read(count);
+        expect(observed[1] == mtp::Status::invalid_distribution &&
+                   observed[3] == mtp::Status::invalid_uniform &&
+                   observed.back() == mtp::Status::invalid_logits,
+               "compact batch error isolation failed");
+      }
+      // Capture and repeated replay reuse only caller-owned, disjoint scratch.
+      cudaGraph_t graph;
+      cudaGraphExec_t executable;
+      check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), "capture compact batch");
+      mtp::build_compact_distributions(batch, vocabulary, stream);
+      check_cuda(cudaStreamEndCapture(stream, &graph), "end compact capture");
+      check_cuda(cudaGraphInstantiate(&executable, graph, 0), "instantiate compact graph");
+      for (unsigned repeat = 0; repeat < 2; ++repeat)
+        check_cuda(cudaGraphLaunch(executable, stream), "replay compact graph");
+      check_cuda(cudaStreamSynchronize(stream), "finish compact replay");
+      compare();
+      check_cuda(cudaGraphExecDestroy(executable), "destroy compact executable");
+      check_cuda(cudaGraphDestroy(graph), "destroy compact graph");
+      const auto unchanged = logits.read(values.size());
+      expect(std::memcmp(values.data(), unchanged.data(), values.size() * sizeof(values[0])) == 0,
+             "compact batch modified input logits");
+      const auto workspace = scratch.read(count * scratch_stride);
+      for (unsigned row = 0; row < count; ++row)
+        expect(std::all_of(workspace.begin() + row * scratch_stride + bytes,
+                           workspace.begin() + (row + 1) * scratch_stride,
+                           [](auto byte) { return byte == 0xa5; }), "compact batch scratch guard changed");
+      const auto invalid = [&](auto rows) {
+        bool rejected = false;
+        try { mtp::build_compact_distributions(rows, vocabulary, stream); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "invalid compact batch inputs accepted");
+      };
+      invalid(std::vector<mtp::CompactDistributionInput>{});
+      auto bad = batch; bad.back().row_size = 0; invalid(bad);
+      bad = batch; bad.back().scratch_size = bytes - 1; invalid(bad);
+      bad = batch; bad.back().temperature = 0; invalid(bad);
+      bad = batch; bad.back().top_p = std::numeric_limits<float>::quiet_NaN(); invalid(bad);
+      bad = batch; bad.back().output = nullptr; invalid(bad);
+    }
+    check_cuda(cudaStreamDestroy(stream), "destroy compact batch stream");
+  }
+  std::cout << "mtp_compact_batch: exact_rows_mixed_settings_masks_errors_guards_capture_boundary_ok\n";
+}
+
 void compact_disjoint_support_test() {
   Fixture fixture(100);
   Device<mtp::TokenProbability> p(6), q(3);
@@ -1124,8 +1228,14 @@ void partitioned_validation_test() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--compact-batch") == 0) {
+      compact_batch_tests();
+      std::cout << "mtp_sampling_compact_batch: PASS\n";
+      return 0;
+    }
+    expect(argc == 1, "expected no arguments or --compact-batch");
     logprob_summary_tests();
     full_top_logprob_summary_test();
     invalid_logprob_argument_tests();
@@ -1140,6 +1250,7 @@ int main() {
     full_vocabulary_test();
     partitioned_validation_test();
     compact_distribution_tests();
+    compact_batch_tests();
     compact_disjoint_support_test();
     verification_cases(true);
     invalid_data_cases(true);

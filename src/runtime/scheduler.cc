@@ -474,6 +474,7 @@ void BatchScheduler::poll(bool inflight) {
 bool BatchScheduler::step() {
     poll(false);
     bool progressed = retire();
+    std::uint64_t prefill_work = 0;
     for (auto& request : requests) {
       if (request.phase != BatchPhase::queued || computes(request) || !owner_ready(request)) continue;
       request.prepared = true;
@@ -600,6 +601,7 @@ bool BatchScheduler::step() {
         requests[owner].prefill_tokens += processed - step.begin;
         requests[owner].cursor = processed;
         prefill_tokens += processed - step.begin;
+        prefill_work += processed - step.begin;
         for (const auto& dep : work->path.dependents()) {
           observe_scheduled(requests[dep.request_id]);
           observe_prompt(requests[dep.request_id], processed, dep.request_id != owner, dep.request_id != owner);
@@ -681,6 +683,7 @@ bool BatchScheduler::step() {
           receive({index});
           const float milliseconds = backend.elapsed("time exact shared head");
           prefill_gpu_seconds += milliseconds / 1000.0;
+          ++prefill_work;
           request.prefill_gpu_seconds += milliseconds / 1000.0;
           request.prefill_seconds += seconds_since(wall);
           request.phase = BatchPhase::decoding;
@@ -787,6 +790,7 @@ bool BatchScheduler::step() {
       receive({index});
       const float milliseconds = backend.elapsed("time shared prefix head");
       prefill_gpu_seconds += milliseconds / 1000.0;
+      ++prefill_work;
       request.prefill_gpu_seconds += milliseconds / 1000.0;
       request.prefill_seconds += seconds_since(wall);
       log_event("active_head", named(index) + "," + number("execution", request.execution) + "," +
@@ -796,6 +800,15 @@ bool BatchScheduler::step() {
       break;
     }
     if (!ran_prefill) ran_prefill = run_prefill();
+    // Batch scheduling work, not GPU rows: retain the selected microbatch
+    // shapes and return through poll/retire between every chunk. Charge a
+    // head as one token so a stream of cache-hit requests cannot starve decode.
+    // If no prefill can run, decode immediately, including under KV pressure.
+    if (prefill_work) {
+      prefill_since_decode += prefill_work;
+      if (prefill_since_decode < limits.prefill_budget_tokens) return true;
+    }
+    prefill_since_decode = 0;
     std::vector<std::size_t> indices;
     std::vector<BatchDecodeInput> inputs;
     for (const auto index : active) {
@@ -1393,6 +1406,8 @@ void BatchScheduler::write_summary(std::ostream& summary) const {
     if (has_pending() || stats.execution_count)
       fail("batch cleanup", "request allocations remain live");
   summary << "{\"requests\":" << submitted << ",\"outputs\":" << outputs
+          << ",\"prefill_chunk_tokens\":" << limits.prefill_chunk_tokens
+          << ",\"prefill_budget_tokens\":" << limits.prefill_budget_tokens
           << ",\"completed_requests\":" << completed << ",\"cancelled_requests\":" << cancelled
           << ",\"cancelled_outputs\":" << cancelled_outputs
           << ",\"cached_tokens\":" << cached_tokens << ",\"prefill_tokens\":" << prefill_tokens

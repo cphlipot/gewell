@@ -432,6 +432,7 @@ int run_jobs(const std::string& artifact_path, std::uint32_t max_batch,
   current = &scheduler;
   scheduler.write_startup_capacity();
   channel.event(Json{{"event", "offline_ready"}, {"max_batch", max_batch}, {"max_pending", limits.max_requests},
+      {"prefill_chunk_tokens", limits.prefill_chunk_tokens}, {"prefill_budget_tokens", limits.prefill_budget_tokens},
       {"max_context_tokens", limits.max_horizon}, {"vocab_size", gemma4::text_contract_31b().vocabulary_size},
       {"mtp_depth", limits.mtp_depth}, {"max_logit_chunk_bytes",
           (std::size_t(limits.mtp_depth) + 1) * gemma4::text_contract_31b().vocabulary_size * 2}}.dump());

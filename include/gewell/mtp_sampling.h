@@ -83,6 +83,26 @@ void build_compact_distribution(
     TokenProbability* output, void* scratch, std::size_t scratch_size,
     Status* status, cudaStream_t stream = nullptr,
     const std::uint32_t* allowed_tokens = nullptr);
+
+struct CompactDistributionInput {
+  const __nv_bfloat16* logits{};
+  float temperature{}, top_p{};
+  std::uint32_t row_size{};
+  TokenProbability* output{};
+  void* scratch{};
+  std::size_t scratch_size{};
+  Status* status{};
+  const std::uint32_t* allowed_tokens{};
+};
+
+// Independent rows, with the same arithmetic and tie ordering as the single
+// row operation. Each entry needs disjoint scratch and output storage. Rows
+// from one request that reuse scratch must be submitted in separate calls.
+// Bounded launch parameters avoid allocations/uploads during graph capture.
+void build_compact_distributions(
+    const std::vector<CompactDistributionInput>& inputs,
+    std::uint32_t vocabulary_size, cudaStream_t stream = nullptr);
+
 void sample_compact_distribution(
     const TokenProbability* probs, std::uint32_t row_size,
     std::uint32_t vocabulary_size, const float* uniform,

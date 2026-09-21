@@ -1316,7 +1316,8 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
                        gewell::nvfp4::ActivationPolicy activation_policy,
                        kv_cache::Format local_kv_format, kv_cache::Format global_kv_format,
                        attention::Compute local_attention_compute, attention::Compute global_attention_compute,
-                       const std::string& assistant_path, const std::string& vision_path) {
+                       const std::string& assistant_path, const std::string& vision_path,
+                       std::uint32_t prefill_budget_tokens) {
   mtp_depth = effective_mtp_depth(mtp_depth, assistant_path);
   if (!max_batch || max_batch > kMaxBatchRows || !kv_cache_gpu_mib ||
       kv_cache_gpu_mib > std::numeric_limits<std::size_t>::max() / kv_cache::kMib)
@@ -1328,6 +1329,7 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
   limits.kv_bytes = kv_cache_gpu_mib * kv_cache::kMib;
   limits.mtp_depth = mtp_depth;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(prefill_chunk_tokens);
+  limits.prefill_budget_tokens = prefill_budget_tokens;
   limits.local_attention_compute = local_attention_compute;
   limits.global_attention_compute = global_attention_compute;
   limits.local_kv_format = local_kv_format;
@@ -1347,7 +1349,7 @@ int run_generate_batch(const std::string& artifact_path, const std::string& requ
     fail("batch MTP", "batch size times (depth + 1) must not exceed 1280 verifier rows");
   const auto staging_bytes = mtp_depth
       ? limits.capacity * mtp_target::Verifier::staging_bytes(mtp_depth + 1) : 0;
-  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, 64 * kv_cache::kMib, limits.local_kv_format, limits.global_kv_format);
+  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
   const auto hidden_bytes = (limits.kv_bytes / config.local_ring_bytes) * model::kHiddenSize * sizeof(BFloat16);
   if (!hidden_bytes || staging_bytes >= limits.kv_bytes || hidden_bytes >= limits.kv_bytes - staging_bytes)
     fail("batch configuration", "staging exceeds GPU KV budget");
@@ -1481,6 +1483,7 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
   limits.capacity = max_batch;
   limits.mtp_depth = mtp_depth;
   limits.prefill_chunk_tokens = checked_prefill_chunk_tokens(settings.prefill_chunk_tokens);
+  limits.prefill_budget_tokens = settings.prefill_budget_tokens;
   limits.local_attention_compute = settings.local_attention_compute;
   limits.global_attention_compute = settings.global_attention_compute;
   limits.local_kv_format = settings.local_kv_format;
@@ -1495,7 +1498,7 @@ BatchLimits live_batch_limits(std::uint32_t max_batch, const RuntimeSettings& se
       ? settings.kv_checkpoint_interval_tokens : 0;
   limits.max_requests = max_connections;
   limits.sampled = limits.captures = limits.live = true;
-  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, 64 * kv_cache::kMib, limits.local_kv_format, limits.global_kv_format);
+  const auto config = sm120::compact_pool_config(limits.kv_bytes, 0, limits.index_bytes, limits.local_kv_format, limits.global_kv_format);
   const auto staging = mtp_depth ? max_batch * mtp_target::Verifier::staging_bytes(mtp_depth + 1) : 0;
   const auto hidden = (limits.kv_bytes / config.local_ring_bytes) * model::kHiddenSize * sizeof(BFloat16);
   if (staging >= limits.kv_bytes || hidden >= limits.kv_bytes - staging ||
@@ -1663,6 +1666,7 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
   console::field("server_batch_capacity", max_batch);
   console::field("server_mtp_depth", settings.mtp_depth);
   console::field("server_prefill_chunk_tokens", settings.prefill_chunk_tokens);
+  console::field("server_prefill_budget_tokens", settings.prefill_budget_tokens);
   scheduler.write_startup_capacity();
   publish_observability(scheduler, transport, metrics, http_settings.model, true);
   auto metrics_published = std::chrono::steady_clock::now();
@@ -1685,6 +1689,7 @@ int run_http_server(const std::string& model_directory, std::uint32_t max_batch,
     console::field("server_max_context_tokens", limits.max_horizon);
     console::field("server_kv_cache_gpu_mib", settings.kv_cache_gpu_mib);
     console::field("server_kv_cache_cpu_mib", settings.kv_cache_cpu_mib);
+    console::field("server_kv_cache_index_mib", settings.kv_cache_index_mib);
     console::field("payload_sha256", artifact::digest_hex(assets.weights.header().payload_sha256));
     console::field("server_ready", true);
   } else {

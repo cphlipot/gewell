@@ -396,7 +396,7 @@ does not free global pages still shared by another.
 |---|---|---|
 | `--kv-cache-gpu-mib` | Required | GPU cache pool plus fixed prefix-hidden and MTP staging |
 | `--kv-cache-cpu-mib` | `0` | CPU retained KV and checkpoint payloads; zero disables this tier |
-| `--kv-cache-index-mib` | `64` | Host token/image index, page/owner records, and bookkeeping |
+| `--kv-cache-index-mib` | `512` | Host token/image index, page/owner records, and bookkeeping |
 | `--kv-local-format`, `--kv-global-format` | `bf16` | KV representation; `fp8` changes capacity and numerical behavior |
 
 All memory flags use MiB (1,048,576 bytes). Inside the GPU pool are shared
@@ -404,6 +404,11 @@ global pages, private local rings and page tables, retained local snapshots,
 terminal state, and temporary copies. Model weights, general executor/vision
 scratch, and output buffers also need device memory outside that pool. See the
 [CLI reference](cli.md#execution-and-cache) for the full settings.
+
+If the host prefix index fills, idle checkpoints are removed from either GPU
+or CPU storage to free their index entries. Spilling alone preserves those
+entries. Index pressure can therefore evict retained KV while the payload
+pools still have free space.
 
 Admission reserves room for the request's declared maximum processed horizon
 and private growth, including restoration and copy-on-write costs. A request

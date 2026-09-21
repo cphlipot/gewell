@@ -42,7 +42,9 @@ class Cycle final {
         void* staging, std::size_t staging_size,
         const nvfp4::Weights* native_weights = nullptr,
         nvfp4::ActivationPolicy activation_policy = nvfp4::ActivationPolicy::always,
-        const fp8::Weights* fp8_weights = nullptr);
+        const fp8::Weights* fp8_weights = nullptr,
+        attention::Compute local_compute = attention::Compute::bf16,
+        attention::Compute global_compute = attention::Compute::bf16);
   ~Cycle();
   Cycle(const Cycle&) = delete;
   Cycle& operator=(const Cycle&) = delete;
@@ -121,7 +123,9 @@ class Batch final {
         std::uint32_t max_depth, void* staging, std::size_t staging_size,
         const nvfp4::Weights* native_weights = nullptr,
         nvfp4::ActivationPolicy activation_policy = nvfp4::ActivationPolicy::always,
-        const fp8::Weights* fp8_weights = nullptr);
+        const fp8::Weights* fp8_weights = nullptr,
+        attention::Compute local_compute = attention::Compute::bf16,
+        attention::Compute global_compute = attention::Compute::bf16);
   ~Batch();
   Batch(const Batch&) = delete;
   Batch& operator=(const Batch&) = delete;

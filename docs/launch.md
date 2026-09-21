@@ -63,8 +63,11 @@ its staging buffers count against the configured memory budget.
 
 Use `--kv-local-format fp8 --kv-global-format fp8` to opt into compressed KV
 storage. `--attention-global-compute fp8` separately opts into FP8 global
-text-prefill matmuls. Both choices can change outputs; validate quality for
-your workload. Weight precision comes from the artifact itself.
+attention matmuls for text prefill, decode, and both MTP paths. The independent
+`--attention-local-compute` option covers local attention in those same phases.
+Image-containing prefill chunks retain BF16 attention. Both choices can change
+outputs; validate quality for your workload. Weight precision comes from the
+artifact itself.
 
 ## Logs and shutdown
 

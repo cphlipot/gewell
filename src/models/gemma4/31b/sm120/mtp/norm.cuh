@@ -31,10 +31,15 @@ __device__ inline float inverse_rms(const float (&values)[kNormValues], float* s
   return result;
 }
 
+// The verifier uses disjoint h0/h1/h2 slices and read-only model weights.
+// Expose that contract so stores to branch cannot serialize later input loads.
 template <bool Scale>
-__global__ void residual_norm(BFloat16* branch, const BFloat16* post_weight,
-                              const BFloat16* residual, const BFloat16* scalar,
-                              const BFloat16* next_weight, BFloat16* normalized) {
+__global__ void residual_norm(BFloat16* __restrict__ branch,
+                              const BFloat16* __restrict__ post_weight,
+                              const BFloat16* __restrict__ residual,
+                              const BFloat16* __restrict__ scalar,
+                              const BFloat16* __restrict__ next_weight,
+                              BFloat16* __restrict__ normalized) {
   __shared__ float sums[kNormThreads];
   const std::size_t row = std::size_t(blockIdx.x) * kHidden;
   float values[kNormValues];

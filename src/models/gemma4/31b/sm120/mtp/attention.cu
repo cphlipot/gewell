@@ -1,9 +1,12 @@
 #include "../kernels/kv_storage.cuh"
+#include "../kernels/fp8_cache.cuh"
+#include "fp8_quantize.cuh"
 #include "gewell/mtp_attention.h"
 
 #include "gewell/compact_global_cache.h"
 #include <math_constants.h>
 #include <mma.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <array>
@@ -71,7 +74,7 @@ __device__ __forceinline__ uint4 load_eight(const BF16* source) {
   return result;
 }
 
-__device__ __forceinline__ void prefetch_compact_l2(const void* address) {
+__device__ __forceinline__ void prefetch_l2(const void* address) {
   const auto global = __cvta_generic_to_global(address);
   asm volatile("prefetch.global.L2 [%0];" : : "l"(global) : "memory");
 }
@@ -119,7 +122,49 @@ __device__ __forceinline__ const BF16* compact_record(
                           640, cache.format, 2);
 }
 
-template <bool Global, bool Paged, bool Frozen = false>
+constexpr unsigned kCompactTileBytes =
+    kKeysPerTile * kv_cache::row_bytes(640, kv_cache::Format::fp8, 2);
+
+// Only complete staged FP8 tiles use this reader. Their rows and eight-byte
+// vectors are aligned, and no vector straddles the rotated-K / V scale split.
+__device__ __forceinline__ uint4 load_compact_shared_eight(
+    const BF16* raw, unsigned token, unsigned d) {
+  const unsigned record = static_cast<unsigned>(__cvta_generic_to_shared(raw)) +
+      token * kv_cache::row_bytes(640, kv_cache::Format::fp8, 2);
+  uint2 packed;
+  float scale;
+  asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];"
+      : "=r"(packed.x), "=r"(packed.y) : "r"(record + d) : "memory");
+  asm volatile("ld.shared.f32 %0, [%1];"
+      : "=f"(scale) : "r"(record + 640 + (d >= 128 ? 4 : 0)) : "memory");
+  return kv_storage::unpack_eight(packed, scale);
+}
+
+// A complete 32-key tile stays inside one 256-token page. Stage the packed
+// bytes (including their scales) while the previous tile's tensor work runs.
+// Tails, staged rows and unaligned views retain the original direct reader.
+template <bool Paged>
+__device__ __forceinline__ bool stage_compact_tile(
+    BF16* destination, const Cache& cache, unsigned head,
+    unsigned begin, unsigned base) {
+  if (cache.format != kv_cache::Format::fp8 || begin + kKeysPerTile > base)
+    return false;
+  const auto* source = compact_record<Paged>(cache, head, begin);
+  if (reinterpret_cast<std::uintptr_t>(source) & 15U) return false;
+  for (unsigned offset = threadIdx.x * 16; offset < kCompactTileBytes;
+       offset += kThreads * 16) {
+    const auto shared = static_cast<unsigned>(__cvta_generic_to_shared(
+        reinterpret_cast<unsigned char*>(destination) + offset));
+    const auto global = __cvta_generic_to_global(
+        reinterpret_cast<const unsigned char*>(source) + offset);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;"
+        : : "r"(shared), "l"(global) : "memory");
+  }
+  asm volatile("cp.async.commit_group;" : : : "memory");
+  return true;
+}
+
+template <bool Global, bool Paged, bool Frozen = false, bool Buffered = false>
 __device__ __forceinline__ void partial_attention_body(
     const BF16* query, const BF16* staged_key, const BF16* staged_value,
     Cache cache, const BF16* k_norm, std::uint32_t base,
@@ -132,10 +177,13 @@ __device__ __forceinline__ void partial_attention_body(
   constexpr unsigned WarpsPerQuery = (kThreads / kWarp) / QueriesPerKv;
   // Reconstruct each global BF16 key once, then reuse the tile for V. The
   // eight-element padding avoids WMMA bank conflicts without changing the
-  // persistent compact layout. The launch bounds keep two 256-thread CTAs
-  // resident without spilling their FP32 accumulators.
+  // persistent compact layout. Unbuffered calls allow two resident CTAs;
+  // buffered FP8 drafting uses one CTA and keeps its invariant inputs resident.
   constexpr unsigned TileWidth = Global ? D + 8 : D;
   constexpr unsigned ValuesPerThread = D / (WarpsPerQuery * kWarp);
+  static_assert(!Buffered || (Global && Frozen));
+  extern __shared__ __align__(16) unsigned char raw_workspace[];
+  auto* raw = reinterpret_cast<BF16*>(raw_workspace);
   __shared__ __align__(32) BF16 tile[kKeysPerTile * TileWidth];
   __shared__ float scores[QueriesPerKv * kKeysPerTile];
   __shared__ __align__(32) float qk_scratch[Global ? 8 * 264 : 1];
@@ -158,6 +206,35 @@ __device__ __forceinline__ void partial_attention_body(
   const unsigned last = Frozen ? base - 1 : base + row;
   const unsigned first = !Global && last >= 1023 ? last - 1023 : 0;
 
+  // Q and k_norm do not change across KV tiles. The buffered frozen kernel's
+  // shared memory already limits it to one CTA, leaving room for these registers.
+  using GlobalQuery = nvcuda::wmma::fragment<
+      nvcuda::wmma::matrix_a, 8, 32, 16, BF16, nvcuda::wmma::row_major>;
+  GlobalQuery frozen_query[Buffered ? 8 : 1];
+  uint4 frozen_norm{};
+  if constexpr (Buffered) {
+    const unsigned d = (threadIdx.x * 8) % D;
+    if (!(d < 64 || (d >= 256 && d < 320)))
+      frozen_norm = load_eight(k_norm + d);
+    if (warp < 4) {
+#pragma unroll
+      for (unsigned k = 0; k < 8; ++k) {
+        const auto* source = query +
+            (std::size_t(kv_head * 8) * rows + row) * D + warp * 128 + k * 16;
+        if ((reinterpret_cast<std::uintptr_t>(query) & 31U) == 0) {
+          nvcuda::wmma::load_matrix_sync(frozen_query[k], source, rows * D);
+        } else {
+          auto* aligned_query = reinterpret_cast<BF16*>(qk_scratch) + warp * 128;
+          for (unsigned i = lane; i < 128; i += kWarp)
+            aligned_query[i] = source[(i / 16) * rows * D + i % 16];
+          __syncwarp();
+          nvcuda::wmma::load_matrix_sync(frozen_query[k], aligned_query, 16);
+          __syncwarp();
+        }
+      }
+    }
+  }
+
   float query_values[D / kWarp];
 #pragma unroll
   for (unsigned i = 0; i < D / kWarp; ++i) {
@@ -171,8 +248,17 @@ __device__ __forceinline__ void partial_attention_body(
   float maximum = -CUDART_INF_F;
   float denominator = 0.0F;
 
+  bool ready = false;
+  if constexpr (Buffered)
+    ready = stage_compact_tile<Paged>(raw, cache, kv_head,
+                                      split * kKeysPerTile, base);
+
   for (unsigned begin = first + split * kKeysPerTile; begin <= last;
        begin += splits * kKeysPerTile) {
+    if (ready) {
+      asm volatile("cp.async.wait_group 0;" : : : "memory");
+      __syncthreads();
+    }
     const unsigned load_count = min(kKeysPerTile, last - begin + 1);
     const unsigned count = load_count;
     if constexpr (Global) {
@@ -189,11 +275,15 @@ __device__ __forceinline__ void partial_attention_body(
               : staged_value + (std::size_t(position - base) * KvHeads + kv_head) * D + d;
           value = load_eight(source);
         } else {
-          value = kv_storage::load_eight(compact_record<Paged>(cache, kv_head, position),
-              rotated ? (d < 64 ? d : d - 192) : 128 + d, 640, cache.format, 128);
+          const auto* record = ready
+              ? raw + (position - begin) * kv_cache::row_words(640, cache.format, 2)
+              : compact_record<Paged>(cache, kv_head, position);
+          const unsigned column = rotated ? (d < 64 ? d : d - 192) : 128 + d;
+          value = ready ? load_compact_shared_eight(raw, position - begin, column)
+                        : kv_storage::load_eight(record, column, 640, cache.format, 128);
         }
         if (!rotated) {
-          const auto n = load_eight(k_norm + d);
+          const auto n = Buffered ? frozen_norm : load_eight(k_norm + d);
           auto* v = reinterpret_cast<__nv_bfloat162*>(&value);
           const auto* scale = reinterpret_cast<const __nv_bfloat162*>(&n);
 #pragma unroll
@@ -222,8 +312,7 @@ __device__ __forceinline__ void partial_attention_body(
     if constexpr (Global) {
       using Accumulator = nvcuda::wmma::fragment<
           nvcuda::wmma::accumulator, 8, 32, 16, float>;
-      using Query = nvcuda::wmma::fragment<
-          nvcuda::wmma::matrix_a, 8, 32, 16, BF16, nvcuda::wmma::row_major>;
+      using Query = GlobalQuery;
       using Key = nvcuda::wmma::fragment<
           nvcuda::wmma::matrix_b, 8, 32, 16, BF16, nvcuda::wmma::col_major>;
       Accumulator accumulator;
@@ -236,7 +325,9 @@ __device__ __forceinline__ void partial_attention_body(
           Key k;
           const auto* query_tile =
               query + (std::size_t(kv_head * 8) * rows + row) * D + d;
-          if ((reinterpret_cast<std::uintptr_t>(query) & 31U) == 0) {
+          if constexpr (Buffered) {
+            q = frozen_query[tile_index];
+          } else if ((reinterpret_cast<std::uintptr_t>(query) & 31U) == 0) {
             nvcuda::wmma::load_matrix_sync(q, query_tile, rows * D);
           } else {
             // The target supplies aligned queries. Preserve the public
@@ -304,10 +395,13 @@ __device__ __forceinline__ void partial_attention_body(
       for (unsigned i = threadIdx.x * 8; i < load_count * D; i += Threads * 8) {
         const unsigned position = begin + i / D;
         const unsigned d = i % D;
+        const auto* record = position >= base ? nullptr : ready
+            ? raw + (position - begin) * kv_cache::row_words(640, cache.format, 2)
+            : compact_record<Paged>(cache, kv_head, position);
         const auto value = position >= base
             ? load_eight(staged_value + (std::size_t(position - base) * KvHeads + kv_head) * D + d)
-            : kv_storage::load_eight(compact_record<Paged>(cache, kv_head, position),
-                                     128 + d, 640, cache.format, 128);
+            : ready ? load_compact_shared_eight(raw, position - begin, 128 + d)
+                    : kv_storage::load_eight(record, 128 + d, 640, cache.format, 128);
         *reinterpret_cast<uint4*>(tile + (i / D) * TileWidth + i % D) = value;
       }
     } else {
@@ -321,6 +415,11 @@ __device__ __forceinline__ void partial_attention_body(
       }
     }
     __syncthreads();
+    // K and V have both consumed the packed tile. Only now may the next
+    // asynchronous copy overwrite it; the existing arithmetic stays intact.
+    if constexpr (Buffered)
+      ready = stage_compact_tile<Paged>(raw, cache, kv_head,
+          begin + splits * kKeysPerTile, base);
     const float new_maximum = next_maximum[score_group];
     const float old_scale = expf(maximum - new_maximum);
     denominator = fmaf(denominator, old_scale,
@@ -395,6 +494,7 @@ __global__ __launch_bounds__(kThreads, 2) void partial_attention(
 // workspace. No expanded K is written to global memory.
 constexpr unsigned kGlobalSharedBytes =
     2 * kKeysPerTile * 520 * sizeof(BF16) + 2 * 8 * 16 * sizeof(float);
+constexpr unsigned kGlobalFp8SharedBytes = kGlobalSharedBytes + kCompactTileBytes;
 
 __device__ __forceinline__ unsigned pair_bits(const BF16* address) {
   const auto pair = load_pair(address);
@@ -440,6 +540,7 @@ __device__ __forceinline__ void global_four_rows_body(
   auto* values = keys + kKeysPerTile * Stride;
   auto* warp_maxima = reinterpret_cast<float*>(values + kKeysPerTile * Stride);
   auto* warp_sums = warp_maxima + 8 * 16;
+  auto* raw = reinterpret_cast<BF16*>(warp_sums + 8 * 16);
   auto* probabilities = keys;
   const unsigned head = grid_x, warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
   const unsigned pair = warp / 4, column_warp = warp % 4;
@@ -467,14 +568,41 @@ __device__ __forceinline__ void global_four_rows_body(
   float numerator[16][4]{};
   float maximum[2]{-CUDART_INF_F, -CUDART_INF_F}, denominator[2]{};
 
+  bool ready = stage_compact_tile<Paged>(raw, cache, head,
+                                        grid_z * kKeysPerTile, base);
+
   for (unsigned begin = grid_z * kKeysPerTile; begin <= last;
        begin += splits * kKeysPerTile) {
+    if (ready) {
+      asm volatile("cp.async.wait_group 0;" : : : "memory");
+      __syncthreads();
+    }
     const unsigned count = min(kKeysPerTile, last - begin + 1);
-    const BF16* committed = begin < base ? compact_record<Paged>(cache, head, begin) : nullptr;
+    const BF16* committed = ready ? raw :
+        begin < base ? compact_record<Paged>(cache, head, begin) : nullptr;
     bool nonfinite = false;
     // Stage eight elements per copy, amortizing page/row addressing. Each
     // vector lies entirely inside or outside the rotated K dimensions.
-    for (unsigned i = threadIdx.x * 8; i < kKeysPerTile * D; i += kThreads * 8) {
+    if (ready) {
+      // Complete committed tiles need no per-vector tail, format, alignment
+      // or staged-row checks. Dimension and normalization are loop-invariant.
+      const unsigned d = thread_dimension;
+      for (unsigned token = threadIdx.x / 64; token < kKeysPerTile; token += 4) {
+        const auto v = load_compact_shared_eight(raw, token, 128 + d);
+        uint4 k;
+        if (thread_rotated)
+          k = load_compact_shared_eight(raw, token, d < 64 ? d : d - 192);
+        else {
+          auto* kp = reinterpret_cast<__nv_bfloat162*>(&k);
+          const auto* vp = reinterpret_cast<const __nv_bfloat162*>(&v);
+          const auto* np = reinterpret_cast<const __nv_bfloat162*>(&norm);
+#pragma unroll
+          for (unsigned pair = 0; pair < 4; ++pair) kp[pair] = __hmul2(vp[pair], np[pair]);
+        }
+        *reinterpret_cast<uint4*>(keys + token * Stride + d) = k;
+        *reinterpret_cast<uint4*>(values + token * Stride + d) = v;
+      }
+    } else for (unsigned i = threadIdx.x * 8; i < kKeysPerTile * D; i += kThreads * 8) {
       const unsigned token = i / D, position = begin + token, d = i % D;
       uint4 v{}, k{};
       if (token < count) {
@@ -527,26 +655,20 @@ __device__ __forceinline__ void global_four_rows_body(
     else
       __syncthreads();
 
-    // Pull the next strided compact tile toward L2 while tensor-core work
-    // consumes this tile. A 32-row tile is page-contained and 128-byte line
-    // spacing covers its rotated K and V exactly once.
+    // The shared K/V matrices no longer depend on raw. Overlap the next
+    // packed copy with QK/PV, retaining L2 prefetch for the direct reader.
     const unsigned prefetch_begin = begin + splits * kKeysPerTile;
-    if (cache.format == kv_cache::Format::bf16 && prefetch_begin < base && prefetch_begin <= last) {
-      const BF16* prefetch_row;
-      if constexpr (Paged)
-        prefetch_row = cache.page_pool + cache.page_offsets[prefetch_begin >> 8] +
-                       cache.layer_offset_elements +
-                       (std::size_t(head) * 256 + (prefetch_begin & 255)) * 640;
-      else
-        prefetch_row = cache.key +
-                       (std::size_t(head) * cache.capacity + prefetch_begin) * 640;
+    ready = stage_compact_tile<Paged>(raw, cache, head, prefetch_begin, base);
+    if (!ready && prefetch_begin < base && prefetch_begin <= last) {
+      const auto* prefetch_row = compact_record<Paged>(cache, head, prefetch_begin);
       constexpr unsigned LineBytes = 128;
       const unsigned prefetch_bytes =
-          min(kKeysPerTile, base - prefetch_begin) * 640 * sizeof(BF16);
+          min(kKeysPerTile, base - prefetch_begin) *
+          kv_cache::row_bytes(640, cache.format, 2);
 #pragma unroll 1
       for (unsigned offset = threadIdx.x * LineBytes; offset < prefetch_bytes;
            offset += kThreads * LineBytes)
-        prefetch_compact_l2(
+        prefetch_l2(
             reinterpret_cast<const unsigned char*>(prefetch_row) + offset);
     }
 
@@ -678,10 +800,12 @@ void launch_global_four_rows(dim3 grid, const BF16* query, const BF16* staged_ke
     unsigned rows, unsigned first, unsigned splits, float* partial,
     float* maxima, float* denominators, cudaStream_t stream) {
   static const auto status = cudaFuncSetAttribute(global_four_rows<Paged>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalSharedBytes);
+      cudaFuncAttributeMaxDynamicSharedMemorySize, kGlobalFp8SharedBytes);
   if (status != cudaSuccess)
     throw std::runtime_error(std::string("MTP shared attention: ") + cudaGetErrorString(status));
-  global_four_rows<Paged><<<grid, kThreads, kGlobalSharedBytes, stream>>>(query,
+  const auto shared = cache.format == kv_cache::Format::fp8
+      ? kGlobalFp8SharedBytes : kGlobalSharedBytes;
+  global_four_rows<Paged><<<grid, kThreads, shared, stream>>>(query,
       staged_key, staged_value, cache, k_norm, base, rows, first, splits,
       partial, maxima, denominators);
 }
@@ -689,6 +813,7 @@ void launch_global_four_rows(dim3 grid, const BF16* query, const BF16* staged_ke
 // Eight causal rows and their two GQA heads fill the 16 MMA rows. Each lane
 // group retains the sliding-window bounds for its query. Softmax stays FP32;
 // P*V rounds probabilities once to BF16 and accumulates in FP32 registers.
+template<bool Prefetch>
 __device__ __forceinline__ void local_eight_rows_body(
     const BF16* query, const BF16* staged_key, const BF16* staged_value,
     Cache cache, std::uint32_t base, std::uint32_t rows,
@@ -697,6 +822,7 @@ __device__ __forceinline__ void local_eight_rows_body(
     unsigned grid_x, unsigned grid_y, unsigned grid_z) {
   constexpr unsigned D = 256, Stride = 264;
   __shared__ __align__(32) BF16 keys[32 * Stride], values[32 * Stride];
+  __shared__ __align__(32) BF16 queries[16 * Stride];
   __shared__ float warp_maxima[4 * 16], warp_sums[4 * 16];
   auto* probabilities = keys;
   const unsigned head = grid_x, warp = threadIdx.x / kWarp, lane = threadIdx.x % kWarp;
@@ -706,16 +832,14 @@ __device__ __forceinline__ void local_eight_rows_body(
   const unsigned visible_first = base + row > 1023 ? base + row - 1023 : 0;
   const unsigned last = base + min(rows - 1, group_first + 7);
   // The 16 MMA rows cover eight causal positions for each of two GQA heads.
-  unsigned q[16][4];
-  if (warp < 4) {
-#pragma unroll
-    for (unsigned k = 0; k < 16; ++k) {
-      const unsigned d = k * 16 + (lane % 4) * 2;
-      const auto* q0 = query + (std::size_t(head * 2) * rows + min(row, rows - 1)) * D;
-      const auto* q1 = q0 + rows * D;
-      q[k][0] = pair_bits(q0 + d); q[k][1] = pair_bits(q1 + d);
-      q[k][2] = pair_bits(q0 + d + 8); q[k][3] = pair_bits(q1 + d + 8);
-    }
+  // Share Q instead of replicating all 64 fragment registers in each compute
+  // warp. This avoids register spills while retaining two resident CTAs.
+  // The first KV-tile barrier publishes these immutable query copies too.
+  for (unsigned i = threadIdx.x * 8; i < 16 * D; i += kThreads * 8) {
+    const unsigned r = i / D, d = i % D;
+    const auto* source = query +
+        (std::size_t(head * 2 + r / 8) * rows + min(group_first + r % 8, rows - 1)) * D + d;
+    *reinterpret_cast<uint4*>(queries + r * Stride + d) = load_eight(source);
   }
   float numerator[8][4]{};
   float maximum[2]{-CUDART_INF_F, -CUDART_INF_F}, denominator[2]{};
@@ -746,13 +870,31 @@ __device__ __forceinline__ void local_eight_rows_body(
       *reinterpret_cast<uint4*>(values + token * Stride + d) = value;
     }
     const bool has_nonfinite = __syncthreads_or(nonfinite);
+    if constexpr (Prefetch) {
+      // The four load-assisting warps are free during QK. Pull the next FP8
+      // tile into L2, covering each 272-byte record and wrapping within its ring.
+      const unsigned prefetch_begin = begin + splits * 32;
+      if (warp >= 4 && prefetch_begin < base && prefetch_begin <= last) {
+        const unsigned token = (threadIdx.x - 128) / 3;
+        const unsigned offset = (threadIdx.x - 128) % 3 * 128;
+        if (token < min(32U, base - prefetch_begin)) {
+          const auto record = std::size_t(head) * 1024 + (prefetch_begin + token) % 1024;
+          const auto* k = kv_storage::row(cache.key, record, D, cache.format);
+          const auto* v = kv_storage::row(cache.value, record, D, cache.format);
+          prefetch_l2(reinterpret_cast<const unsigned char*>(k) + offset);
+          prefetch_l2(reinterpret_cast<const unsigned char*>(v) + offset);
+        }
+      }
+    }
     float score[4]{};
     if (warp < 4) {
 #pragma unroll
       for (unsigned k = 0; k < 16; ++k) {
+        unsigned query_fragment[4];
+        matrix_load_a(query_fragment, queries + (lane % 16) * Stride + (lane / 16) * 8 + k * 16);
         unsigned key[2];
         matrix_load_b<false>(key, keys + (warp * 8 + lane % 8) * Stride + k * 16 + ((lane / 8) % 2) * 8);
-        mma_16x8(score, q[k], key);
+        mma_16x8(score, query_fragment, key);
       }
 #pragma unroll
       for (unsigned h = 0; h < 2; ++h) {
@@ -857,7 +999,7 @@ __global__ __launch_bounds__(kThreads, 2) void local_eight_rows(
     Cache cache, std::uint32_t base, std::uint32_t rows,
     std::uint32_t first_row, std::uint32_t splits,
     float* partial, float* maxima, float* denominators) {
-  local_eight_rows_body(query, staged_key, staged_value, cache, base, rows, first_row, splits, partial, maxima, denominators,
+  local_eight_rows_body<false>(query, staged_key, staged_value, cache, base, rows, first_row, splits, partial, maxima, denominators,
       blockIdx.x, blockIdx.y, blockIdx.z);
 }
 
@@ -982,14 +1124,15 @@ bool plan_batch(AttentionBatch& batch, unsigned count, bool global,
   return true;
 }
 
-template<bool Global, bool Paged, bool FourRows, bool Frozen = false>
-__global__ __launch_bounds__(kThreads, (Global && FourRows) ? 1 : 2)
+template<bool Global, bool Paged, bool FourRows, bool Frozen, bool Fp8>
+__global__ __launch_bounds__(kThreads, (Global && (FourRows || (Frozen && Fp8))) ? 1 : 2)
 void batched_partial_attention(const __grid_constant__ AttentionBatch batch,
                                const BF16* k_norm) {
   unsigned index = 0;
   while (blockIdx.y >= batch.tiles[index].end_blocks) ++index;
   const auto& tile = batch.tiles[index];
-  const auto& input = tile.input;
+  auto input = tile.input;
+  input.cache.format = Fp8 ? kv_cache::Format::fp8 : kv_cache::Format::bf16;
   const auto block = blockIdx.y - (index ? batch.tiles[index - 1].end_blocks : 0);
   const auto group = block % tile.groups, split = block / tile.groups;
   static_assert(!Frozen || (Global && !FourRows));
@@ -998,11 +1141,11 @@ void batched_partial_attention(const __grid_constant__ AttentionBatch batch,
         input.cache, k_norm, input.base_position, input.rows, tile.first, tile.splits,
         tile.partial, tile.maxima, tile.denominators, blockIdx.x, group, split);
   else if constexpr (FourRows)
-    local_eight_rows_body(input.query, input.staged_key, input.staged_value,
+    local_eight_rows_body<Fp8>(input.query, input.staged_key, input.staged_value,
         input.cache, input.base_position, input.rows, tile.first, tile.splits,
         tile.partial, tile.maxima, tile.denominators, blockIdx.x, group, split);
   else
-    partial_attention_body<Global, Paged, Frozen>(input.query, input.staged_key, input.staged_value,
+    partial_attention_body<Global, Paged, Frozen, Global && Frozen && Fp8>(input.query, input.staged_key, input.staged_value,
         input.cache, k_norm, input.base_position, input.rows, tile.first, tile.splits,
         tile.partial, tile.maxima, tile.denominators, blockIdx.x, group, split);
 }
@@ -1017,25 +1160,38 @@ __global__ void batched_finalize_attention(const __grid_constant__ AttentionBatc
       tile.first, tile.splits, tile.input.context, blockIdx.x, row);
 }
 
-template<bool Global, bool Paged, bool FourRows, bool Frozen = false>
-void launch_batch(const AttentionBatch& batch, unsigned count,
-                   const BF16* k_norm, cudaStream_t stream) {
-  constexpr auto shared = Global && FourRows ? kGlobalSharedBytes : 0;
+template<bool Global, bool Paged, bool FourRows, bool Frozen, bool Fp8>
+void launch_batch_format(const AttentionBatch& batch, unsigned count,
+                         const BF16* k_norm, cudaStream_t stream) {
+  constexpr auto shared = Global && FourRows
+      ? (Fp8 ? kGlobalFp8SharedBytes : kGlobalSharedBytes)
+      : Global && Frozen && Fp8 ? kCompactTileBytes : 0;
   if constexpr (shared) {
     static const auto status = cudaFuncSetAttribute(
-        batched_partial_attention<Global, Paged, FourRows, Frozen>,
+        batched_partial_attention<Global, Paged, FourRows, Frozen, Fp8>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, shared);
     if (status != cudaSuccess)
       throw std::runtime_error(std::string("MTP batched shared attention: ") + cudaGetErrorString(status));
   }
   const auto& last = batch.tiles[count - 1];
-  batched_partial_attention<Global, Paged, FourRows, Frozen>
+  batched_partial_attention<Global, Paged, FourRows, Frozen, Fp8>
       <<<dim3(Global ? 4 : 16, last.end_blocks), kThreads, shared, stream>>>(batch, k_norm);
   check_launch();
   batched_finalize_attention<Global ? 512 : 256>
       <<<dim3(kHeads, last.end_rows), kThreads, 0, stream>>>(batch);
   check_launch();
 }
+
+template<bool Global, bool Paged, bool FourRows, bool Frozen = false>
+void launch_batch(const AttentionBatch& batch, unsigned count,
+                  const BF16* k_norm, cudaStream_t stream) {
+  if (batch.tiles[0].input.cache.format == kv_cache::Format::fp8)
+    launch_batch_format<Global, Paged, FourRows, Frozen, true>(batch, count, k_norm, stream);
+  else
+    launch_batch_format<Global, Paged, FourRows, Frozen, false>(batch, count, k_norm, stream);
+}
+
+#include "fp8_attention.cuh"
 }  // namespace
 
 std::size_t scratch_bytes(std::uint32_t rows, std::uint32_t context) {
@@ -1054,7 +1210,7 @@ static unsigned checked_splits(const BF16* query, const BF16* staged_key, const 
       (!frozen && (!staged_key || !staged_value)) || !context || !scratch || !rows ||
       rows > mtp_target::kMaxDepth + 1 ||
       std::uint64_t(base) + (frozen ? 0 : rows) > kMaxContext ||
-      (frozen && (!base || rows != 1 || !global)))
+      (frozen && (!base || rows != 1)))
     throw std::invalid_argument("MTP attention inputs outside capacity");
   if (global) {
     if (!k_norm)
@@ -1077,6 +1233,50 @@ static unsigned checked_splits(const BF16* query, const BF16* staged_key, const 
   if (bytes < bytes_for(rows, splits, D))
     throw std::invalid_argument("MTP attention scratch is too small");
   return splits;
+}
+
+void run_fp8_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
+                   gemma4_31b::AttentionKind kind, void* scratch,
+                   std::size_t bytes, cudaStream_t stream, bool frozen) {
+  if (inputs.empty()) throw std::invalid_argument("FP8 attention batch is empty");
+  for (const auto& i : inputs)
+    checked_splits(i.query, i.staged_key, i.staged_value, i.cache, k_norm,
+        i.base_position, i.rows, kind, i.context, scratch, bytes, frozen);
+  const bool global = kind == gemma4_31b::AttentionKind::global;
+  AttentionBatch batch{};
+  unsigned count = 0;
+  bool paged = false;
+  const auto flush = [&] {
+    if (!count) return;
+    if (global && paged) {
+      if (frozen) launch_fp8_attention<true, true, true>(batch, count, k_norm, stream);
+      else launch_fp8_attention<true, true, false>(batch, count, k_norm, stream);
+    } else if (global) {
+      if (frozen) launch_fp8_attention<true, false, true>(batch, count, k_norm, stream);
+      else launch_fp8_attention<true, false, false>(batch, count, k_norm, stream);
+    } else {
+      if (frozen) launch_fp8_attention<false, false, true>(batch, count, nullptr, stream);
+      else launch_fp8_attention<false, false, false>(batch, count, nullptr, stream);
+    }
+    count = 0;
+  };
+  for (const auto& i : inputs) {
+    for (unsigned first = 0; first < i.rows; first += kQueryTileRows) {
+      if (count == kBatchTiles || (count && paged != bool(i.cache.page_pool))) flush();
+      paged = bool(i.cache.page_pool);
+      const unsigned rows = std::min(kQueryTileRows, i.rows - first);
+      const unsigned group_rows = global ? (frozen ? 2 : 4) : 8;
+      const AttentionTile tile{i, first, rows, 0, (rows + group_rows - 1) / group_rows};
+      batch.tiles[count] = tile;
+      if (!plan_batch(batch, count + 1, global, scratch, bytes, frozen)) {
+        flush(); batch.tiles[0] = tile;
+        if (!plan_batch(batch, 1, global, scratch, bytes, frozen))
+          throw std::logic_error("validated FP8 attention tile does not fit scratch");
+      }
+      ++count;
+    }
+  }
+  flush();
 }
 
 static void run_impl(const BF16* query, const BF16* staged_key, const BF16* staged_value,
@@ -1189,7 +1389,8 @@ void run_batch(const std::vector<BatchInput>& inputs, const BF16* k_norm,
     for (unsigned first = 0; first < i.rows; first += kQueryTileRows) {
       const auto tile_rows = std::min(kQueryTileRows, i.rows - first);
       if (count == kBatchTiles ||
-          (count && (paged != bool(i.cache.page_pool) || four_rows != (i.rows > 1)))) flush();
+          (count && (paged != bool(i.cache.page_pool) || four_rows != (i.rows > 1) ||
+                     batch.tiles[0].input.cache.format != i.cache.format))) flush();
       paged = bool(i.cache.page_pool);
       four_rows = i.rows > 1;
       const unsigned group_rows = global ? 4 : 8;
@@ -1239,7 +1440,8 @@ void run_frozen_global_batch(const std::vector<BatchInput>& inputs,
   };
   for (const auto& input : inputs) {
     if (count == kBatchTiles ||
-        (count && paged != bool(input.cache.page_pool)))
+        (count && (paged != bool(input.cache.page_pool) ||
+                   batch.tiles[0].input.cache.format != input.cache.format)))
       flush();
     paged = bool(input.cache.page_pool);
     const AttentionTile tile{input, 0, 1, 0, 1};

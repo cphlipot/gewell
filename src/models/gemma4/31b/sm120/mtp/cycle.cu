@@ -309,7 +309,8 @@ struct Cycle::Impl {
   Impl(cublasLtHandle_t handle, const mtp_target::Weights& weights,
        std::uint32_t capacity, std::uint32_t depth, void* stage,
        std::size_t stage_size, const nvfp4::Weights* native_weights,
-       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* fp8_weights)
+       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* fp8_weights,
+       attention::Compute local_compute, attention::Compute global_compute)
       : context_capacity(capacity),
         max_depth(depth),
         staging(stage),
@@ -317,9 +318,9 @@ struct Cycle::Impl {
         layout(depth),
         own(layout.bytes),
         constraints(depth + 1),
-        assistant(handle, assistant_weights(weights), capacity),
+        assistant(handle, assistant_weights(weights), capacity, 1, local_compute, global_compute),
         target(handle, weights, depth + 1, capacity, native_weights,
-               activation_policy, fp8_weights) {
+               activation_policy, fp8_weights, local_compute, global_compute) {
     require(capacity > 0 && capacity <= 262'144,
             "context capacity is outside the model range");
     require(stage != nullptr &&
@@ -338,10 +339,11 @@ Cycle::Cycle(cublasLtHandle_t handle, const mtp_target::Weights& weights,
              void* staging, std::size_t staging_size,
              const nvfp4::Weights* native_weights,
              nvfp4::ActivationPolicy activation_policy,
-             const fp8::Weights* fp8_weights)
+             const fp8::Weights* fp8_weights,
+             attention::Compute local_compute, attention::Compute global_compute)
     : impl_(std::make_unique<Impl>(handle, weights, context_capacity, max_depth,
                                    staging, staging_size, native_weights,
-                                   activation_policy, fp8_weights)) {}
+                                   activation_policy, fp8_weights, local_compute, global_compute)) {}
 
 Cycle::~Cycle() = default;
 
@@ -537,15 +539,16 @@ struct Batch::Impl {
   Impl(cublasLtHandle_t handle, const mtp_target::Weights& weights,
        std::uint32_t context, std::uint32_t cap, std::uint32_t depth,
        void* stage, std::size_t bytes, const nvfp4::Weights* native_weights,
-       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* fp8_weights)
+       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* fp8_weights,
+       attention::Compute local_compute, attention::Compute global_compute)
       : capacity(batch_capacity(cap, depth, stage, bytes)), max_depth(depth), context_capacity(context), staging(stage),
         stage_stride(mtp_target::Verifier::staging_bytes(depth + 1)), layout(depth),
         own(std::size_t(cap) * layout.bytes),
         tokens(std::size_t(cap) * (depth + 1) * sizeof(std::uint32_t)),
         constraints(cap * (depth + 1)),
-        assistant(handle, assistant_weights(weights), context, cap),
+        assistant(handle, assistant_weights(weights), context, cap, local_compute, global_compute),
         target(handle, weights, cap * (depth + 1), context, native_weights,
-               activation_policy, fp8_weights) {}
+               activation_policy, fp8_weights, local_compute, global_compute) {}
 
   template <typename T> T* at(std::size_t request, std::size_t offset) const {
     return own.at<T>(request * layout.bytes + offset);
@@ -557,10 +560,11 @@ Batch::Batch(cublasLtHandle_t handle, const mtp_target::Weights& weights,
              std::uint32_t max_depth, void* staging, std::size_t staging_size,
              const nvfp4::Weights* native_weights,
              nvfp4::ActivationPolicy activation_policy,
-             const fp8::Weights* fp8_weights)
+             const fp8::Weights* fp8_weights,
+             attention::Compute local_compute, attention::Compute global_compute)
     : impl_(std::make_unique<Impl>(handle, weights, context_capacity, capacity,
                                    max_depth, staging, staging_size, native_weights,
-                                   activation_policy, fp8_weights)) {}
+                                   activation_policy, fp8_weights, local_compute, global_compute)) {}
 Batch::~Batch() = default;
 
 std::size_t Batch::scratch_bytes() const {
@@ -629,9 +633,11 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
   std::vector<mtp_assistant::Input> drafts;
   std::vector<mtp_sampling::GreedyDistributionInput> greedy_distributions;
   std::vector<mtp_sampling::GreedyVerificationInput> greedy_verifications;
+  std::vector<mtp_sampling::CompactDistributionInput> compact_distributions;
   drafts.reserve(inputs.size());
   greedy_distributions.reserve(total_rows);
   greedy_verifications.reserve(inputs.size());
+  compact_distributions.reserve(inputs.size());
   for (std::uint32_t step = 0; step < s.max_depth; ++step) {
     drafts.clear();
     for (std::size_t i = 0; i < inputs.size(); ++i) {
@@ -658,6 +664,21 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
       mtp_sampling::build_greedy_distributions(
           greedy_distributions, kVocabulary, stream);
     } else {
+      compact_distributions.clear();
+      for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const auto& input = inputs[i];
+        if (step >= input.depth || !s.compact_sizes[i]) continue;
+        compact_distributions.push_back({
+            s.at<mtp_target::BFloat16>(i, l.assistant_logits),
+            input.temperature, input.top_p, s.compact_sizes[i],
+            s.at<mtp_sampling::TokenProbability>(i, l.draft_probs) +
+                std::size_t(step) * s.compact_sizes[i],
+            s.at<void>(i, l.sampling), l.sampling_bytes,
+            s.at<mtp_sampling::Status>(i, l.status), nullptr});
+      }
+      if (!compact_distributions.empty())
+        mtp_sampling::build_compact_distributions(compact_distributions,
+                                                  kVocabulary, stream);
       for (std::size_t i = 0; i < inputs.size(); ++i) {
         const auto& input = inputs[i];
         if (step >= input.depth) continue;
@@ -666,7 +687,7 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
         auto* uniforms = s.at<float>(i, l.uniforms);
         void* sampling = s.at<void>(i, l.sampling);
         auto* probabilities = s.at<float>(i, l.draft_probs);
-        build_probability_row(
+        if (!s.compact_sizes[i]) build_probability_row(
             s.at<mtp_target::BFloat16>(i, l.assistant_logits),
             input.temperature, input.top_p, input.top_k, probabilities, step,
             s.compact_sizes[i], sampling, l.sampling_bytes, status, stream);
@@ -738,13 +759,35 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
     mtp_sampling::verify_greedy_sequences(greedy_verifications, kVocabulary,
                                           stream);
   }
+  if (!greedy) {
+    // Rows of one request share scratch. Batch across requests at each row,
+    // then reuse that scratch only after the previous row's kernels finish.
+    for (std::uint32_t row = 0; row <= s.max_depth; ++row) {
+      compact_distributions.clear();
+      for (std::size_t i = 0; i < inputs.size(); ++i) {
+        const auto& input = inputs[i];
+        if (row > input.depth || !s.compact_sizes[i]) continue;
+        compact_distributions.push_back({
+            logits(i) + std::size_t(row) * kVocabulary,
+            input.temperature, input.top_p, s.compact_sizes[i],
+            s.at<mtp_sampling::TokenProbability>(i, l.target_probs) +
+                std::size_t(row) * s.compact_sizes[i],
+            s.at<void>(i, l.sampling), l.sampling_bytes,
+            s.at<mtp_sampling::Status>(i, l.status),
+            input.constraint_mask ? s.constraints.row(s.offsets[i] + row) : nullptr});
+      }
+      if (compact_distributions.empty()) break;
+      mtp_sampling::build_compact_distributions(compact_distributions,
+                                                kVocabulary, stream);
+    }
+  }
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const auto& input = inputs[i];
     auto* status = s.at<mtp_sampling::Status>(i, l.status);
     auto* target_probs = s.at<float>(i, l.target_probs);
     auto* uniforms = s.at<float>(i, l.uniforms);
     void* sampling = s.at<void>(i, l.sampling);
-    if (!greedy)
+    if (!greedy && !s.compact_sizes[i])
       for (std::uint32_t row = 0; row <= input.depth; ++row)
         build_probability_row(
             logits(i) + std::size_t(row) * kVocabulary,

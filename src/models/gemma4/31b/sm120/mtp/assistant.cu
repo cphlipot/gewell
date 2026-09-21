@@ -74,6 +74,15 @@ mtp_target::CacheView global_cache_view(const FrozenCache& cache) {
   return view;
 }
 
+mtp_target::CacheView local_cache_view(const FrozenCache& cache) {
+  mtp_target::CacheView view{};
+  view.key = const_cast<BFloat16*>(cache.local_key);
+  view.value = const_cast<BFloat16*>(cache.local_value);
+  view.capacity = 1024;
+  view.format = cache.local_format;
+  return view;
+}
+
 __device__ float block_reduce(float value, float* values) {
   values[threadIdx.x] = value;
   __syncthreads();
@@ -164,8 +173,9 @@ class Executor::Impl {
   };
 
   Impl(cublasLtHandle_t handle, const Weights& weights, unsigned capacity,
-       unsigned batch_capacity)
-      : handle(handle), weights(weights), capacity(capacity), batch_capacity(batch_capacity) {
+       unsigned batch_capacity, attention::Compute local, attention::Compute global)
+      : handle(handle), weights(weights), capacity(capacity), batch_capacity(batch_capacity),
+        local_compute(local), global_compute(global) {
     require(handle && weights.target_embedding && weights.target_global_k_norm,
             "handle and target weight views are required");
     require(batch_capacity > 0 && batch_capacity <= 1280, "invalid assistant batch capacity");
@@ -202,6 +212,7 @@ class Executor::Impl {
   cublasLtHandle_t handle;
   Weights weights;
   unsigned capacity, batch_capacity;
+  attention::Compute local_compute, global_compute;
   std::map<unsigned, std::unique_ptr<Plans>> plans;
   std::size_t bytes{}, attention_bytes{};
   void* arena{};
@@ -214,8 +225,10 @@ class Executor::Impl {
 };
 
 Executor::Executor(cublasLtHandle_t handle, const Weights& weights,
-                   std::uint32_t context_capacity, std::uint32_t batch_capacity)
-    : impl_(std::make_unique<Impl>(handle, weights, context_capacity, batch_capacity)) {}
+                   std::uint32_t context_capacity, std::uint32_t batch_capacity,
+                   attention::Compute local_compute, attention::Compute global_compute)
+    : impl_(std::make_unique<Impl>(handle, weights, context_capacity, batch_capacity,
+                                  local_compute, global_compute)) {}
 
 Executor::~Executor() = default;
 
@@ -306,7 +319,17 @@ void Executor::Impl::forward(const std::vector<Input>& inputs, cudaStream_t stre
           global ? s.global_sin : s.local_sin, s.query_rope, rows, 32,
           kind, stream);
     if (trace) capture(trace->query_rope[layer], s.query_rope, 32 * head_width);
-    if (rows == 1) {
+    if ((global ? global_compute : local_compute) == attention::Compute::fp8) {
+      global_attention.clear();
+      for (unsigned row = 0; row < rows; ++row) {
+        const auto offset = std::size_t(row) * 32 * head_width;
+        global_attention.push_back({s.query_rope + offset, nullptr, nullptr,
+            global ? global_cache_view(inputs[row].cache) : local_cache_view(inputs[row].cache),
+            inputs[row].cache.processed_tokens, 1, s.context + offset});
+      }
+      mtp_attention::run_fp8_batch(global_attention, s.weights.target_global_k_norm, kind,
+          s.attention, s.attention_bytes, stream, true);
+    } else if (rows == 1) {
       attend_frozen_prefix(s.query_rope, inputs[0].cache,
           s.weights.target_global_k_norm, kind, s.attention, s.context, stream);
     } else if (global) {

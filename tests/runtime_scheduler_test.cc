@@ -53,6 +53,7 @@ class TestBackend final : public ExecutionBackend {
     for (std::uint32_t i = 0; i < rows; ++i) state[0] += tokens[i];
     state[1] = position + rows;
     prefill_rows += rows;
+    operations.emplace_back('P', rows);
     if (fail_prefill) throw std::runtime_error("injected prefill failure");
   }
   std::uint32_t image_prefill_step(kv_cache::ExecutionId execution, const std::uint32_t* tokens,
@@ -61,6 +62,7 @@ class TestBackend final : public ExecutionBackend {
       TerminalState hidden, const std::function<bool()>& continue_prefill) override {
     require(!image_live, "image features from preceding request remained live");
     require(begin < end && end <= rows, "invalid image prefill range");
+    if (on_image_begin) on_image_begin();
     if (!continue_prefill()) return begin;
     image_live = image_inflight = true;
     ++image_prefills;
@@ -90,11 +92,13 @@ class TestBackend final : public ExecutionBackend {
     if (image_live) { ++image_releases; image_live = false; }
   }
   void prefix_head_step(kv_cache::ExecutionId, TerminalState hidden) override {
+    operations.emplace_back('H', 1);
     ids[0] = static_cast<const std::uint32_t*>(hidden.value)[0] % 60 + 1;
   }
   void decode_batch(const std::vector<BatchDecodeInput>& inputs) override {
     require(!image_live, "decode overlapped in-flight image features");
     decode_sizes.push_back(inputs.size());
+    operations.emplace_back('D', inputs.size());
     for (std::size_t row = 0; row < inputs.size(); ++row) {
       const auto& in = inputs[row];
       cache->prepare_write(in.execution, in.position, 1, {});
@@ -113,6 +117,7 @@ class TestBackend final : public ExecutionBackend {
   BatchMtpOutcome run_batch_mtp(const std::vector<BatchMtpInput>& inputs) override {
     require(!image_live, "MTP overlapped in-flight image features");
     decode_sizes.push_back(inputs.size());
+    operations.emplace_back('D', inputs.size());
     BatchMtpOutcome result;
     proposals = inputs;
     for (const auto& input : inputs) {
@@ -152,6 +157,7 @@ class TestBackend final : public ExecutionBackend {
   bool fail_image{}, fail_hidden{}, image_live{};
   mutable bool image_inflight{}, decode_inflight{};
   std::function<void()> on_decode;
+  std::function<void()> on_image_begin;
   std::uint32_t image_prefills{}, image_releases{}, encoded_images{}, fail_image_number{};
   mutable std::size_t waits{};
   std::map<void*,std::unique_ptr<std::array<std::uint32_t,4>>> states;
@@ -163,6 +169,7 @@ class TestBackend final : public ExecutionBackend {
   std::vector<std::uint32_t> commits;
   std::vector<std::size_t> commit_batch_sizes;
   std::vector<std::size_t> decode_sizes;
+  std::vector<std::pair<char, std::uint32_t>> operations;
 };
 BatchLimits limits(std::uint32_t depth = 0) {
   BatchLimits value;
@@ -204,11 +211,12 @@ void run(BatchScheduler& scheduler) {
   for (int turn = 0; scheduler.has_pending() && turn < 1000; ++turn) scheduler.step();
   require(!scheduler.has_pending(), "scheduler failed to make bounded progress");
 }
-void shared_prefix_and_seed() {
+void shared_prefix_and_seed(std::uint32_t budget = 0) {
   Output output;
   auto backend = std::make_unique<TestBackend>();
   auto* device = backend.get();
-  BatchScheduler scheduler(std::move(backend), limits(), output.callbacks());
+  auto configured = limits(); configured.prefill_budget_tokens = budget;
+  BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
   auto a = request("a",{2,3,4,5,6,7}); a.sampling.temperature = 0.8F;
   auto b = request("b",{2,3,4,5,6,7}); b.sampling.temperature = 0.8F;
   scheduler.submit(std::move(a)); scheduler.submit(std::move(b));
@@ -218,7 +226,7 @@ void shared_prefix_and_seed() {
   require(output.processed.at("a") == 9 && output.processed.at("b") == 9, "fed and emitted cursors conflated");
   require(device->states.empty() && device->cache->stats().execution_count == 0, "completed execution leaked");
 }
-void cancellation_and_backpressure() {
+void cancellation_and_backpressure(std::uint32_t budget = 0) {
   Output output; output.blocked.insert("slow");
   auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
   BatchScheduler* running = nullptr; bool cancelled = false;
@@ -226,7 +234,8 @@ void cancellation_and_backpressure() {
   callbacks.poll = [&](bool inflight) {
     if (inflight && !cancelled) { cancelled = true; running->cancel(0, true); }
   };
-  BatchScheduler scheduler(std::move(backend), limits(), std::move(callbacks)); running = &scheduler;
+  auto configured = limits(); configured.prefill_budget_tokens = budget;
+  BatchScheduler scheduler(std::move(backend), configured, std::move(callbacks)); running = &scheduler;
   scheduler.submit(request("producer",{2,3,4,5,6,7}));
   scheduler.submit(request("neighbor",{2,3,4,5,6,7}));
   scheduler.submit(request("slow",{2,3,4,5,6,7}));
@@ -270,6 +279,75 @@ void mtp_commit_and_stop_fallback() {
                       [](bool value) { return !value; }),
           "MTP request without logprobs required probability rows");
 }
+void logical_prefill_budgets() {
+  for (const auto depth : {0U, 3U}) {
+    std::map<std::string, std::vector<std::uint32_t>> reference;
+    for (const auto budget : {0U, 1U, 4U, 16U, 0xffffffffU}) {
+      Output output;
+      auto backend = std::make_unique<TestBackend>(16384); auto* device = backend.get();
+      auto configured = limits(depth);
+      configured.kv_bytes = 16384 + 512;
+      configured.prefill_budget_tokens = budget;
+      BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+      scheduler.submit(request("hot", {1,2}, 56));
+      for (int turn = 0; device->decode_sizes.empty() && turn < 20; ++turn) scheduler.step();
+      require(!device->decode_sizes.empty(), "budget delayed decode without prefill work");
+      device->operations.clear();
+      for (const auto* id : {"a", "b"}) {
+        auto next = request(id, {2});
+        next.prompt = std::make_shared<const std::vector<std::uint32_t>>(24, id[0] == 'a' ? 2 : 3);
+        scheduler.submit(std::move(next));
+      }
+      run(scheduler);
+      std::uint64_t work = 0, largest_burst = 0;
+      std::uint32_t physical_rows = 0;
+      for (const auto& [kind, size] : device->operations) {
+        if (kind == 'D') {
+          largest_burst = std::max(largest_burst, work);
+          // The budget never splits a physical chunk. A final chunk may
+          // overshoot the target by at most chunk_cap - 1 text tokens.
+          const auto bound = budget ? std::uint64_t(budget) + device->chunk_cap - 1 : device->chunk_cap;
+          require(work <= bound, "logical budget failed to bound the prefill burst");
+          work = 0;
+        } else {
+          work += size;
+          if (kind == 'P') {
+            require(size <= device->chunk_cap, "logical budget enlarged a microbatch");
+            physical_rows += size;
+          }
+        }
+      }
+      require(physical_rows == 48, "logical budget skipped or repeated prefill tokens");
+      if (budget > device->chunk_cap)
+        require(largest_burst > device->chunk_cap, "logical budget did not group microbatches");
+      if (reference.empty()) reference = output.tokens;
+      require(output.tokens == reference, "logical budget changed request-local output/RNG");
+      require(device->states.empty() && device->cache->stats().execution_count == 0,
+              "logical budget leaked executions or terminal state");
+    }
+  }
+}
+
+void logical_budget_under_kv_pressure() {
+  for (const auto depth : {0U, 3U}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(2048); auto* device = backend.get();
+    auto configured = limits(depth);
+    configured.kv_bytes = 2048 + 512;
+    configured.prefill_budget_tokens = 64;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("a", {2,2,2,2,2,2,2,2}));
+    scheduler.submit(request("b", {3,3,3,3,3,3,3,3}));
+    run(scheduler);
+    require(output.tokens["a"].size() == 4 && output.tokens["b"].size() == 4,
+            "logical budget waited for prefills that could not be admitted");
+    require(*std::max_element(device->decode_sizes.begin(), device->decode_sizes.end()) == 1,
+            "KV pressure fixture unexpectedly held both requests");
+    require(device->states.empty() && device->cache->stats().execution_count == 0,
+            "logical budget pressure cleanup leaked");
+  }
+}
+
 void failure_cleanup() {
   Output output; auto backend = std::make_unique<TestBackend>();
   backend->fail_prefill = true;
@@ -287,7 +365,50 @@ BatchRequest image_request(const char* id, std::uint8_t pixel = 1, std::uint32_t
   value.images.push_back(std::move(image));
   return value;
 }
-void images_share_and_mix_with_text() {
+void logical_budget_failed_prefill() {
+  for (const auto depth : {0U, 3U}) for (const bool image : {false, true}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    auto configured = limits(depth); configured.live = true; configured.prefill_budget_tokens = 64;
+    auto callbacks = output.callbacks();
+    auto finish = callbacks.finish;
+    callbacks.finish = [finish](auto& r) { finish(r); r.delivered = true; };
+    bool failed = false, cancel_image = false, cancelled = false;
+    std::size_t bad = 0;
+    BatchScheduler* running = nullptr;
+    callbacks.reject = [&](auto&, const auto&, auto) { failed = true; };
+    callbacks.poll = [&](bool inflight) {
+      if (inflight && cancel_image && !cancelled) {
+        cancelled = true;
+        running->cancel(bad, true);
+      }
+    };
+    BatchScheduler scheduler(std::move(backend), configured, std::move(callbacks)); running = &scheduler;
+    scheduler.submit(request("hot", {1,2}, 32));
+    for (int turn = 0; device->decode_sizes.empty() && turn < 20; ++turn) scheduler.step();
+    require(!device->decode_sizes.empty(), "failure fixture did not prepare a decoder");
+    device->fail_prefill = !image;
+    if (image) device->on_image_begin = [&] { cancel_image = true; };
+    bad = scheduler.submit(image ? image_request("bad") : request("bad", {8,8,8,8}));
+    for (int turn = 0; !failed && !cancelled && turn < 20; ++turn) {
+      const auto decodes = device->decode_sizes.size();
+      scheduler.step();
+      if (failed || cancelled)
+        require(device->decode_sizes.size() > decodes,
+                "failed/zero-progress prefill incorrectly deferred a ready decoder");
+    }
+    require(failed || cancelled, "prefill failure/cancellation was not injected");
+    device->fail_prefill = false;
+    device->on_image_begin = {};
+    run(scheduler);
+    require(output.tokens["bad"].empty() && output.tokens["hot"].size() == 32,
+            "failed prefill emitted output or stopped its neighbor");
+    require(device->states.empty() && device->cache->stats().execution_count == 0,
+            "failed budgeted prefill leaked state");
+  }
+}
+
+void images_share_and_mix_with_text(std::uint32_t budget = 0) {
   Output output;
   auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
   auto callbacks = output.callbacks();
@@ -295,7 +416,7 @@ void images_share_and_mix_with_text() {
   callbacks.start = [&](auto& r) { started.push_back(r.id); };
   auto finish = callbacks.finish;
   callbacks.finish = [finish](auto& r) { finish(r); r.delivered = true; };
-  auto live = limits(); live.live = true;
+  auto live = limits(); live.live = true; live.prefill_budget_tokens = budget;
   BatchScheduler scheduler(std::move(backend), live, std::move(callbacks));
   scheduler.submit(request("before",{2,3,4,5,6,7},3));
   scheduler.submit(image_request("image1",1));
@@ -645,6 +766,9 @@ int main() {
   try {
     using namespace gewell::runtime;
     shared_prefix_and_seed(); cancellation_and_backpressure(); mtp_commit_and_stop_fallback(); failure_cleanup();
+    logical_prefill_budgets(); logical_budget_under_kv_pressure(); cancellation_and_backpressure(16);
+    logical_budget_failed_prefill();
+    shared_prefix_and_seed(16); images_share_and_mix_with_text(16);
     images_share_and_mix_with_text(); image_mtp_and_admission_validation(); image_cancellation_and_failure();
     shared_image_cancellation_and_fairness();
     image_decode_cancellation(); multiple_images_and_long_prompt(); multi_image_partial_cleanup();

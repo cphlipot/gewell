@@ -81,45 +81,17 @@ struct QkvRopeBatch {
   unsigned end_rows[kQkvRopeBatchEntries];
 };
 
+// One warp per head, shared by prefill and batched verification. Recreate
+// norm_head's 256-thread reduction: first fold dimensions 256 apart, then
+// offsets 128/64/32 and finally 16/8/4/2/1. Normalized RoPE pairs stay in the
+// same lane's registers, preserving each BF16 rounding boundary.
 template<bool Global>
-__global__ void qkv_rms_rope_batch_kernel(const __grid_constant__ QkvRopeBatch batch,
-                                         const BFloat16* q_weight,
-                                         const BFloat16* k_weight) {
-  constexpr unsigned D = Global ? 512 : 256, heads = Global ? 4 : 16;
-  constexpr unsigned input_heads = 32 + (Global ? heads : 2 * heads);
-  unsigned request = 0;
-  while (blockIdx.y >= batch.end_rows[request]) ++request;
-  const auto& input = batch.inputs[request];
-  const unsigned row = blockIdx.y - (request ? batch.end_rows[request - 1] : 0);
-  const unsigned head = blockIdx.x;
-  const bool q = head < 32, v = head >= 32 + heads;
-  const unsigned source_head = Global && v ? head - heads : head;
-  const unsigned output_head = q ? head : (head - 32) % heads;
-  __shared__ BFloat16 normalized[D];
-  norm_head(input.qkv + (std::size_t(row) * input_heads + source_head) * D,
-      q ? q_weight : k_weight, normalized, D, kRmsNormEpsilon, !v);
-  __syncthreads();
-  auto* output = q ? input.query : v ? input.value : input.key;
-  const auto offset = v ? (std::size_t(row) * heads + output_head) * D
-                        : (std::size_t(output_head) * input.rows + row) * D;
-  for (unsigned d = threadIdx.x; d < D; d += blockDim.x)
-    output[offset + d] = v ? normalized[d] : rope_element<D>(normalized,
-        input.cosine + std::size_t(row) * D, input.sine + std::size_t(row) * D, d);
-}
-
-// Prefill has enough rows to use a warp per head. Recreate norm_head's 256
-// thread reduction: first fold dimensions 256 apart, then offsets 128/64/32,
-// and finally 16/8/4/2/1. Normalized RoPE pairs stay in the same lane's registers.
-template<bool Global>
-__global__ void qkv_rms_rope_prefill_kernel(
-    const __grid_constant__ QkvRopeInput input,
-    const BFloat16* q_weight, const BFloat16* k_weight) {
+__device__ __forceinline__ void qkv_rms_rope_head(const QkvRopeInput& input,
+    const BFloat16* q_weight, const BFloat16* k_weight, unsigned head, unsigned row) {
   constexpr unsigned D = Global ? 512 : 256, heads = Global ? 4 : 16;
   constexpr unsigned input_heads = 32 + (Global ? heads : 2 * heads);
   constexpr unsigned elements = D / kWarpThreads;
   const unsigned lane = threadIdx.x % kWarpThreads;
-  const unsigned head = blockIdx.x * (kThreads / kWarpThreads) + threadIdx.x / kWarpThreads;
-  const unsigned row = blockIdx.y;
   const bool q = head < 32, v = head >= 32 + heads;
   const unsigned source_head = Global && v ? head - heads : head;
   const unsigned output_head = q ? head : (head - 32) % heads;
@@ -163,6 +135,46 @@ __global__ void qkv_rms_rope_prefill_kernel(
       result = __float2bfloat16_rn(__bfloat162float(direct) + __bfloat162float(cross));
     }
     output[offset + d] = result;
+  }
+}
+
+template<bool Global>
+__global__ void qkv_rms_rope_prefill_kernel(
+    const __grid_constant__ QkvRopeInput input,
+    const BFloat16* q_weight, const BFloat16* k_weight) {
+  const unsigned head = blockIdx.x * (kThreads / kWarpThreads) + threadIdx.x / kWarpThreads;
+  qkv_rms_rope_head<Global>(input, q_weight, k_weight, head, blockIdx.y);
+}
+
+template<bool Global, bool WarpHeads>
+__global__ void qkv_rms_rope_batch_kernel(const __grid_constant__ QkvRopeBatch batch,
+                                         const BFloat16* q_weight,
+                                         const BFloat16* k_weight) {
+  unsigned request = 0;
+  while (blockIdx.y >= batch.end_rows[request]) ++request;
+  const auto& input = batch.inputs[request];
+  const unsigned row = blockIdx.y - (request ? batch.end_rows[request - 1] : 0);
+  if constexpr (WarpHeads) {
+    const unsigned head = blockIdx.x * (kThreads / kWarpThreads) + threadIdx.x / kWarpThreads;
+    qkv_rms_rope_head<Global>(input, q_weight, k_weight, head, row);
+  } else {
+    // Tiny cohorts need a CTA per head to expose enough memory parallelism.
+    constexpr unsigned D = Global ? 512 : 256, heads = Global ? 4 : 16;
+    constexpr unsigned input_heads = 32 + (Global ? heads : 2 * heads);
+    const unsigned head = blockIdx.x;
+    const bool q = head < 32, v = head >= 32 + heads;
+    const unsigned source_head = Global && v ? head - heads : head;
+    const unsigned output_head = q ? head : (head - 32) % heads;
+    __shared__ BFloat16 normalized[D];
+    norm_head(input.qkv + (std::size_t(row) * input_heads + source_head) * D,
+        q ? q_weight : k_weight, normalized, D, kRmsNormEpsilon, !v);
+    __syncthreads();
+    auto* output = q ? input.query : v ? input.value : input.key;
+    const auto offset = v ? (std::size_t(row) * heads + output_head) * D
+                          : (std::size_t(output_head) * input.rows + row) * D;
+    for (unsigned d = threadIdx.x; d < D; d += blockDim.x)
+      output[offset + d] = v ? normalized[d] : rope_element<D>(normalized,
+          input.cosine + std::size_t(row) * D, input.sine + std::size_t(row) * D, d);
   }
 }
 
@@ -498,9 +510,12 @@ void qkv_rms_rope_batch(const std::vector<QkvRopeInput>& inputs,
     if (count == 1 && rows >= 32) {
       if (global) qkv_rms_rope_prefill_kernel<true><<<dim3(5, rows), kThreads, 0, stream>>>(batch.inputs[0], q_weight, k_weight);
       else qkv_rms_rope_prefill_kernel<false><<<dim3(8, rows), kThreads, 0, stream>>>(batch.inputs[0], q_weight, k_weight);
+    } else if (rows >= 64) {
+      if (global) qkv_rms_rope_batch_kernel<true, true><<<dim3(5, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
+      else qkv_rms_rope_batch_kernel<false, true><<<dim3(8, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
     } else {
-      if (global) qkv_rms_rope_batch_kernel<true><<<dim3(40, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
-      else qkv_rms_rope_batch_kernel<false><<<dim3(64, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
+      if (global) qkv_rms_rope_batch_kernel<true, false><<<dim3(40, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
+      else qkv_rms_rope_batch_kernel<false, false><<<dim3(64, rows), kThreads, 0, stream>>>(batch, q_weight, k_weight);
     }
     check_cuda(cudaGetLastError(), operation);
     count = rows = 0;

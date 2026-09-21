@@ -122,8 +122,11 @@ struct BatchLimits {
   kv_cache::Format global_kv_format{kv_cache::Format::bf16};
   std::uint32_t capacity{}, mtp_depth{}, plan_rows{}, max_horizon{};
   std::uint32_t prefill_chunk_tokens{0};
+  // Soft prefill-token budget between decode passes; zero runs decode after
+  // each prefill chunk/head. Physical chunks and image spans remain atomic.
+  std::uint32_t prefill_budget_tokens{};
   std::size_t kv_bytes{}, max_requests{4096};
-  std::size_t cpu_bytes{}, index_bytes{64 * kv_cache::kMib};
+  std::size_t cpu_bytes{}, index_bytes{kv_cache::kDefaultIndexBytes};
   std::uint32_t checkpoint_interval{};
   bool sampled{}, captures{}, logprobs{}, live{};
 };
@@ -262,6 +265,7 @@ class BatchScheduler {
   std::vector<std::unique_ptr<BatchPrefixWork>> works;
   std::uint64_t next_work{};
   bool prefer_prefill{};
+  std::uint64_t prefill_since_decode{};
 
   std::chrono::steady_clock::time_point started{};
   std::map<std::size_t, std::uint64_t> occupancy, verifier_occupancy;

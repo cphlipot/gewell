@@ -7,7 +7,7 @@ through an OpenAI-compatible HTTP API and supports local token-based generation.
 Features include streamed responses, tool conversations, JSON-constrained
 answers, continuous batching, prefix caching with optional CPU storage, and
 MTP speculative decoding using the Gemma assistant. Local and global
-KV storage can independently use BF16 or FP8.
+KV storage can independently use BF16 or FP8 (no, I will not be implementing FP4. Go lobotomize your models somewhere else).
 
 The project is pre-release: artifact formats and CLI contracts can change.
 

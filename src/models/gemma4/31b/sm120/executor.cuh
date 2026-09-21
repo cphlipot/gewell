@@ -4,6 +4,7 @@
 #include "weights.cuh"
 #include "request_cache.cuh"
 #include "gewell/mtp_cycle.h"
+#include "gewell/mtp_attention.h"
 #include "gewell/logprobs.h"
 #include <map>
 #include <memory>
@@ -233,7 +234,9 @@ class Executor {
         checkpoint_triggers_(std::move(checkpoint_triggers)),
         scratch_layout_(std::max(kMultimodalChunkTokens, checked_prefill_chunk_tokens(chunk_cap))),
         scratch_(scratch_layout_.kBytes),
-        attention_scratch_(decode_attention_scratch_bytes(global_capacity_, decode_batch_capacity)),
+        attention_scratch_(std::max(decode_attention_scratch_bytes(global_capacity_, decode_batch_capacity),
+            local_compute == attention::Compute::fp8 || global_compute == attention::Compute::fp8
+                ? mtp_attention::scratch_bytes(1, global_capacity_) : std::size_t{0})),
         prefill_attention_scratch_(prefill::tensor_attention_scratch_bytes(
             std::max(prefill_chunk_tokens_, chunk_cap))),
         caches_(global_capacity_, persistent_cache, persistent_execution, local_format, global_format),
@@ -280,7 +283,8 @@ class Executor {
       }
       mtp_ = std::make_unique<mtp_cycle::Cycle>(
           handle_.get(), weights.pointers(), global_capacity_, mtp_depth_,
-          staging, bytes, &weights.native_weights(), activation_policy_, &weights.fp8_weights());
+          staging, bytes, &weights.native_weights(), activation_policy_, &weights.fp8_weights(),
+          local_compute_, global_compute_);
       mtp_uniforms_.resize(2 * mtp_depth_ + 1);
     }
     std::uint32_t previous_trigger = 0;
@@ -432,7 +436,8 @@ class Executor {
     if (mtp_depth)
       batch_mtp_ = std::make_unique<mtp_cycle::Batch>(handle_.get(), weights_.pointers(),
           global_capacity_, capacity, mtp_depth, staging, staging_bytes,
-          &weights_.native_weights(), activation_policy_, &weights_.fp8_weights());
+          &weights_.native_weights(), activation_policy_, &weights_.fp8_weights(),
+          local_compute_, global_compute_);
   }
 
   void prefill_step(kv_cache::ExecutionId execution, const std::uint32_t* tokens,
@@ -694,8 +699,11 @@ class Executor {
         batch_output_ids(), h0, rows, stream);
     primitives::rms_norm_hidden_rows(h0, layers_[0].input_norm, h1, rows, stream);
     std::vector<primitives::DecodeAttentionInput> attention_inputs(rows > 1 ? rows : 0);
+    std::vector<mtp_attention::BatchInput> fp8_inputs(
+        local_compute_ == attention::Compute::fp8 || global_compute_ == attention::Compute::fp8 ? rows : 0);
     for (std::uint32_t layer = 0; layer < model::kLayerCount; ++layer) {
       const bool global = model::is_global_layer(layer);
+      const bool fp8_compute = (global ? global_compute_ : local_compute_) == attention::Compute::fp8;
       const auto kind = global ? model::AttentionKind::global : model::AttentionKind::local;
       const auto head_size = global ? model::kGlobalHeadSize : model::kLocalHeadSize;
       const auto kv_heads = global ? model::kGlobalKvHeadCount : model::kLocalKvHeadCount;
@@ -713,7 +721,7 @@ class Executor {
         auto* k = k_rope + std::size_t(row) * kv_width;
         auto* v = v_norm + std::size_t(row) * kv_width;
         auto* result = context + std::size_t(row) * q_width;
-        if (rows > 1) {
+        if (rows > 1 && !fp8_compute) {
           attention_inputs[row] = {q_norm + std::size_t(row) * q_width,
               k_norm + std::size_t(row) * kv_width, v, cosine, sine, q,
               cache.key, cache.value,
@@ -732,16 +740,23 @@ class Executor {
               cache.page_stride_elements, cache.layer_offset_elements, cache.format};
           prefill::write_kv_cache_chunk_global_compact_paged(k, v, paged,
                                                            input.position, 1, stream);
-          primitives::causal_gqa_attention_cached_m1_fused_global_compact_paged(
-              q, paged, weight.k_norm, input.position, attention_scratch_.data(), result, stream);
+          if (!fp8_compute)
+            primitives::causal_gqa_attention_cached_m1_fused_global_compact_paged(
+                q, paged, weight.k_norm, input.position, attention_scratch_.data(), result, stream);
         } else {
           primitives::write_kv_cache_m1(k, v, cache.key, cache.value,
                                         input.position, cache.capacity, kind, stream, cache.format);
-          primitives::causal_gqa_attention_cached_m1_fused(q, cache.key, cache.value,
-              input.position, cache.capacity, attention_scratch_.data(), result, kind, stream, cache.format);
+          if (!fp8_compute)
+            primitives::causal_gqa_attention_cached_m1_fused(q, cache.key, cache.value,
+                input.position, cache.capacity, attention_scratch_.data(), result, kind, stream, cache.format);
         }
+        if (fp8_compute)
+          fp8_inputs[row] = {q, nullptr, nullptr, cache, input.position + 1, 1, result};
       }
-      if (rows > 1)
+      if (fp8_compute)
+        mtp_attention::run_fp8_batch(fp8_inputs, weight.k_norm, kind,
+            attention_scratch_.data(), attention_scratch_.size(), stream, true);
+      else if (rows > 1)
         primitives::decode_attention_batch(attention_inputs, weight.k_norm,
             attention_scratch_.data(), attention_scratch_.size(), kind, stream);
       projection_linear(plans.output(global), rows, layer, model::TensorRole::o_proj,
@@ -1459,6 +1474,8 @@ class Executor {
   }
 
   void decode_generated_token(std::uint32_t position) {
+    std::vector<mtp_attention::BatchInput> fp8_inputs(
+        local_compute_ == attention::Compute::fp8 || global_compute_ == attention::Compute::fp8 ? 1 : 0);
     BFloat16* const h0 = at<BFloat16>(scratch_layout_.kH0);
     BFloat16* const h1 = at<BFloat16>(scratch_layout_.kH1);
     BFloat16* const h2 = at<BFloat16>(scratch_layout_.kH2);
@@ -1512,6 +1529,7 @@ class Executor {
           global ? model::kGlobalKvHeadCount : model::kLocalKvHeadCount;
       const LayerWeights& weight = layers_[layer];
       const LayerCacheView cache = caches_.layer(layer);
+      const bool fp8_compute = (global ? global_compute_ : local_compute_) == attention::Compute::fp8;
       const BFloat16* const cosine = global ? global_cos : local_cos;
       const BFloat16* const sine = global ? global_sin : local_sin;
       project_qkv(decode_plans_, 1, layer, h1, q_raw, k_raw, v_raw,
@@ -1533,14 +1551,14 @@ class Executor {
           };
           prefill::write_kv_cache_chunk_global_compact_paged(
               k_rope, v_norm, paged_cache, position, 1, stream);
-          primitives::
+          if (!fp8_compute) primitives::
               causal_gqa_attention_cached_m1_fused_global_compact_paged(
                   q_rope, paged_cache, weight.k_norm, position,
                   attention_scratch_.data(), context, stream);
         } else {
           primitives::write_kv_cache_m1_global_compact(
               k_rope, v_norm, cache.key, position, cache.capacity, stream, cache.format);
-          primitives::causal_gqa_attention_cached_m1_fused_global_compact(
+          if (!fp8_compute) primitives::causal_gqa_attention_cached_m1_fused_global_compact(
               q_rope, cache.key, weight.k_norm, position, cache.capacity,
               attention_scratch_.data(), context, stream, cache.format);
         }
@@ -1548,9 +1566,15 @@ class Executor {
         primitives::write_kv_cache_m1(
             k_rope, v_norm, cache.key, cache.value, position,
             cache.capacity, kind, stream, cache.format);
-        primitives::causal_gqa_attention_cached_m1_fused(
+        if (!fp8_compute) primitives::causal_gqa_attention_cached_m1_fused(
             q_rope, cache.key, cache.value, position, cache.capacity,
-            attention_scratch_.data(), context, kind, stream, cache.format);
+              attention_scratch_.data(), context, kind, stream, cache.format);
+      }
+
+      if (fp8_compute) {
+        fp8_inputs[0] = {q_rope, nullptr, nullptr, cache, position + 1, 1, context};
+        mtp_attention::run_fp8_batch(fp8_inputs, weight.k_norm, kind,
+            attention_scratch_.data(), attention_scratch_.size(), stream, true);
       }
 
       const LinearPlan& o_plan =

@@ -12,6 +12,7 @@
 namespace gewell::kv_cache {
 
 inline constexpr std::size_t kMib = 1U << 20;
+inline constexpr std::size_t kDefaultIndexBytes = 512 * kMib;
 
 enum class Tier : std::uint8_t { gpu, cpu };
 

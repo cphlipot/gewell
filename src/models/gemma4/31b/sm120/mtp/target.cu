@@ -268,17 +268,20 @@ struct Verifier::Impl {
   Buffer attention_scratch;
   std::map<std::uint32_t, std::unique_ptr<Plans>> plans;
   BFloat16* staged{};
+  attention::Compute local_compute, global_compute;
 
   Impl(cublasLtHandle_t h, const Weights& w, std::uint32_t cap,
        std::uint32_t context, const nvfp4::Weights* native,
-       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* native_fp8)
+       nvfp4::ActivationPolicy activation_policy, const fp8::Weights* native_fp8,
+       attention::Compute local, attention::Compute global)
       : handle(h),
         weights(w),
         capacity(valid_rows(cap)),
         context_capacity(context),
         layout(cap),
         scratch(layout.bytes),
-        attention_scratch(mtp_attention::scratch_bytes(cap, context)) {
+        attention_scratch(mtp_attention::scratch_bytes(cap, context)),
+        local_compute(local), global_compute(global) {
     if (!handle)
       throw std::invalid_argument("MTP target requires cuBLAS handle");
     if (native) native_weights = *native;
@@ -327,9 +330,10 @@ Verifier::Verifier(cublasLtHandle_t h, const Weights& w, std::uint32_t rows,
                    std::uint32_t context_capacity,
                    const nvfp4::Weights* native_weights,
                    nvfp4::ActivationPolicy activation_policy,
-                   const fp8::Weights* fp8_weights)
+                   const fp8::Weights* fp8_weights,
+                   attention::Compute local_compute, attention::Compute global_compute)
     : impl_(std::make_unique<Impl>(h, w, rows, context_capacity, native_weights,
-                                   activation_policy, fp8_weights)) {}
+                                   activation_policy, fp8_weights, local_compute, global_compute)) {}
 
 Verifier::~Verifier() = default;
 
@@ -414,11 +418,14 @@ void Verifier::run_batch(const std::uint32_t* tokens,
   p::embedding_lookup_device_tokens(s.weights[0], tokens, h0, rows, stream);
   p::rms_norm(h0, s.weights[1], h1, rows, H, 1e-6F, stream);
   const bool batched = inputs.size() > 1;
-  std::vector<mtp_attention::BatchInput> attention_inputs(batched ? inputs.size() : 0);
+  std::vector<mtp_attention::BatchInput> attention_inputs(
+      batched || s.local_compute == attention::Compute::fp8 || s.global_compute == attention::Compute::fp8
+          ? inputs.size() : 0);
   std::vector<p::QkvRopeInput> rope_inputs(batched ? inputs.size() : 0);
   std::size_t staging_layer_elements = 0;
   for (std::uint32_t i = 0; i < m::kLayerCount; ++i) {
     const bool global = m::is_global_layer(i);
+    const bool fp8_attention = (global ? s.global_compute : s.local_compute) == attention::Compute::fp8;
     const auto kind = global ? m::AttentionKind::global : m::AttentionKind::local;
     const std::uint32_t d = global ? 512 : 256, heads = global ? 4 : 16;
     const std::size_t b = 1 + 14 * i - i / 6;
@@ -488,7 +495,7 @@ void Verifier::run_batch(const std::uint32_t* tokens,
                                        sin + rope_offset, key, heads, input.rows,
                                        kind, stream);
       }
-      if (batched)
+      if (batched || fp8_attention)
         attention_inputs[request++] = {query, key, value, input.caches[i],
             input.base_position, input.rows, context + query_offset};
       else
@@ -499,7 +506,10 @@ void Verifier::run_batch(const std::uint32_t* tokens,
     }
     if (joined_qkv && batched)
       p::qkv_rms_rope_batch(rope_inputs, weight(3 + shift), weight(4 + shift), kind, stream);
-    if (batched)
+    if (fp8_attention)
+      mtp_attention::run_fp8_batch(attention_inputs, global ? weight(4) : nullptr, kind,
+          s.attention_scratch.data(), s.attention_scratch.size(), stream);
+    else if (batched)
       mtp_attention::run_batch(attention_inputs, global ? weight(4) : nullptr, kind,
           s.attention_scratch.data(), s.attention_scratch.size(), stream);
 

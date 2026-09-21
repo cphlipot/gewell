@@ -152,6 +152,153 @@ void cold_restore_and_owner_release(bool multimodal) {
           cache.stats().cpu.used == 0, "cold owner release leaked state");
 }
 
+kv_cache::PoolConfig index_pressure_config(bool offload) {
+  auto config = small_cache_config(65536, offload ? 65536 : 0);
+  config.global_page_tokens = 64;
+  config.local_ring_bytes = 1024;
+  config.local_bytes_per_token = 128;
+  return config;
+}
+
+void index_pressure_keeps_admitting(bool offload) {
+  std::size_t removals = 0;
+  PersistentCacheManager cache(index_pressure_config(offload), byte_storage_factory(),
+      [&](const nlohmann::json& event) {
+        if (event.at("reason") == "prefix_index_pressure") ++removals;
+      });
+  std::array<std::uint8_t, 16> terminal{};
+  kv_cache::CheckpointId pinned = 0, borrowed = 0;
+  kv_cache::ExecutionId borrower = 0;
+  for (std::uint32_t i = 0; i < 12; ++i) {
+    const std::vector<std::uint32_t> prompt(64, i + 1);
+    const auto execution = cache.try_begin_batch(0, prompt.size(), {});
+    require(bool(execution), "index pressure execution did not fit");
+    cache.prepare_write(*execution, 0, prompt.size(), {});
+    const auto checkpoint = cache.try_capture(*execution, prompt, TerminalState{terminal.data()}, {});
+    require(checkpoint != 0 && cache.find_longest(prompt).checkpoint == checkpoint,
+            "index pressure prevented a new checkpoint despite idle victims");
+    cache.release(*execution);
+    if (i == 0) {
+      pinned = checkpoint;
+      cache.pin_batch_checkpoint(pinned);
+    } else if (i == 1) {
+      borrowed = checkpoint;
+      const auto resumed = cache.try_begin_batch(borrowed, prompt.size(), {});
+      require(bool(resumed), "index pressure borrower did not fit");
+      borrower = *resumed;
+    }
+    require(cache.has_checkpoint(pinned) && (!borrowed || cache.has_checkpoint(borrowed)),
+            "index pressure evicted a pinned or borrowed GPU checkpoint");
+    require(cache.stats().index_used <= cache.config().index_bytes,
+            "index pressure exceeded the metadata budget");
+  }
+  require(removals != 0 && cache.cold_spill_count() == 0 && cache.stats().cpu.used == 0,
+          "prefix index pressure spilled instead of reclaiming entries");
+  cache.unpin_batch_checkpoint(pinned);
+  cache.release(borrower);
+}
+
+void index_pressure_reclaims_cold_entries() {
+  ByteStorage* storage = nullptr;
+  PersistentCacheManager cache(index_pressure_config(true), byte_storage_factory(&storage));
+  std::array<std::uint8_t, 16> terminal{};
+  std::vector<kv_cache::CheckpointId> checkpoints;
+  std::size_t entry_bytes = 0;
+  do {
+    const std::vector<std::uint32_t> prompt(64, checkpoints.size() + 1);
+    const auto execution = cache.try_begin_batch(0, prompt.size(), {});
+    require(bool(execution), "cold index fixture admission failed");
+    cache.prepare_write(*execution, 0, prompt.size(), {});
+    const auto before = cache.prefix_stats().used_bytes;
+    const auto checkpoint = cache.try_capture(*execution, prompt, TerminalState{terminal.data()}, {});
+    require(checkpoint != 0, "cold index fixture capture failed");
+    entry_bytes = cache.prefix_stats().used_bytes - before;
+    cache.release(*execution);
+    // Exercise the normal GPU-pressure spill path before applying trie pressure.
+    require(storage->ledger.evict_idle_checkpoint() && cache.is_cold_checkpoint(checkpoint),
+            "GPU pressure did not preserve the fixture in RAM");
+    checkpoints.push_back(checkpoint);
+    cache.pin_batch_checkpoint(checkpoint);
+  } while (entry_bytes <= cache.prefix_stats().capacity_bytes - cache.prefix_stats().used_bytes);
+  require(checkpoints.size() >= 3, "cold index fixture has insufficient protected entries");
+  const auto borrowed = checkpoints.front();
+  const auto borrower = cache.try_begin_batch(borrowed, 64, {});
+  require(bool(borrower), "cold index borrower did not fit");
+  cache.unpin_batch_checkpoint(borrowed);
+  const auto before = cache.stats();
+  const auto spills = cache.cold_spill_count();
+  const std::vector<std::uint32_t> incoming(64, 100);
+  const auto execution = cache.try_begin_batch(0, incoming.size(), {});
+  require(bool(execution), "cold index incoming execution did not fit");
+  cache.prepare_write(*execution, 0, incoming.size(), {});
+  require(cache.try_capture(*execution, incoming, TerminalState{terminal.data()}, {}) == 0,
+          "index pressure displaced pinned or borrowed RAM state");
+  require(cache.stats().checkpoint_count == checkpoints.size() && cache.stats().cpu.used == before.cpu.used,
+          "failed index admission changed protected RAM state");
+  const auto victim = checkpoints.back();
+  cache.unpin_batch_checkpoint(victim);
+  const auto checkpoint = cache.try_capture(*execution, incoming, TerminalState{terminal.data()}, {});
+  require(checkpoint != 0 && !cache.has_checkpoint(victim) && !cache.is_cold_checkpoint(checkpoint),
+          "index pressure failed to replace an idle RAM entry with a GPU checkpoint");
+  for (std::size_t i = 0; i + 1 < checkpoints.size(); ++i) {
+    require(cache.has_checkpoint(checkpoints[i]), "index reclamation lost protected RAM state");
+    if (i != 0) cache.unpin_batch_checkpoint(checkpoints[i]);
+  }
+  require(cache.stats().cpu.used < before.cpu.used && cache.cold_spill_count() == spills,
+          "index reclamation did not release RAM without further spilling");
+  cache.release(*execution);
+  cache.release(*borrower);
+}
+
+void owner_demand_reuse_and_rollback() {
+  PersistentCacheManager cache(small_cache_config(16384), byte_storage_factory());
+  std::array<std::uint8_t, 16> terminal{};
+  std::vector<kv_cache::CheckpointId> checkpoints;
+  for (std::uint32_t i = 0; i < 3; ++i) {
+    const std::vector<std::uint32_t> prompt(4, i + 1);
+    const auto execution = cache.try_begin_batch(0, prompt.size(), {});
+    require(bool(execution), "owner fixture admission failed");
+    cache.prepare_write(*execution, 0, prompt.size(), {});
+    const auto checkpoint = cache.try_capture(*execution, prompt, TerminalState{terminal.data()}, {},
+        prefix_index::CheckpointSource::input_endpoint, false);
+    require(checkpoint && cache.add_owner_demands({checkpoint}, "base", prefix_index::RetentionPriority::normal),
+            "owner fixture capture failed");
+    checkpoints.push_back(checkpoint);
+    cache.release(*execution);
+  }
+  const auto shared = checkpoints[1];
+  require(cache.add_owner_demands({shared}, "shared", prefix_index::RetentionPriority::normal),
+          "shared owner admission failed");
+  const auto before = cache.stats().index_used;
+  PersistentCacheManager::OwnerDemandCommit commit;
+  commit.changes.reserve(checkpoints.size());
+  require(cache.add_owner_demands(checkpoints, "shared", prefix_index::RetentionPriority::high, nullptr, &commit),
+          "owner rollback setup failed");
+  cache.rollback_owner_demands("shared", &commit);
+  require(commit.changes.empty() && cache.stats().index_used == before,
+          "owner rollback retained new demands");
+  cache.release_owner("base");
+  require(!cache.has_checkpoint(checkpoints[0]) && cache.has_checkpoint(shared) &&
+          !cache.has_checkpoint(checkpoints[2]), "owner release lost shared state or skipped demands");
+
+  PersistentCacheManager::OwnerDemandReservation reservation;
+  require(cache.reserve_owner_demand_slots(1, &reservation), "owner slot reservation failed");
+  const auto filler_count = cache.owner_demand_slot_capacity() - 2;
+  for (std::size_t i = 0; i < filler_count; ++i)
+    require(cache.add_owner_demands({shared}, std::to_string(i), prefix_index::RetentionPriority::normal),
+            "owner capacity was lost after release");
+  require(!cache.add_automatic_demand(shared), "automatic demand consumed a reserved slot");
+  require(cache.add_owner_demands({shared}, "reserved", prefix_index::RetentionPriority::normal, &reservation) &&
+          reservation.slots == 0 && !cache.add_automatic_demand(shared), "owner capacity bound was not enforced");
+  cache.release_owner("0");
+  require(cache.add_automatic_demand(shared), "released owner slot was not reusable");
+  for (std::size_t i = 1; i < filler_count; ++i) cache.release_owner(std::to_string(i));
+  cache.release_owner("shared");
+  cache.release_owner("reserved");
+  require(cache.has_checkpoint(shared) && cache.stats().checkpoint_count == 1,
+          "owner cleanup removed automatic retention");
+}
+
 void image_checkpoint_identity() {
   for (const std::uint32_t count : {4U, 8U}) {
     ByteStorage* storage = nullptr;
@@ -279,6 +426,10 @@ int main() {
     live_cow_and_owner_release();
     cold_restore_and_owner_release(false);
     cold_restore_and_owner_release(true);
+    index_pressure_keeps_admitting(true);
+    index_pressure_keeps_admitting(false);
+    index_pressure_reclaims_cold_entries();
+    owner_demand_reuse_and_rollback();
     image_checkpoint_identity();
     capacity_errors_and_metadata();
     std::cout << "runtime cache tests: ok\n";

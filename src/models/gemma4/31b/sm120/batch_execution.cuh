@@ -9,7 +9,7 @@ struct BatchMemoryPlan {
   BatchMemoryPlan(std::size_t total, std::uint32_t capacity, std::uint32_t depth,
                   kv_cache::Format local, kv_cache::Format global)
       : staging_bytes(depth ? capacity * mtp_target::Verifier::staging_bytes(depth + 1) : 0),
-        hidden_slots(total / compact_pool_config(total, 0, 64 * kv_cache::kMib, local, global).local_ring_bytes),
+        hidden_slots(total / compact_pool_config(total, 0, kv_cache::kDefaultIndexBytes, local, global).local_ring_bytes),
         hidden_staging_bytes(hidden_slots * hidden_bytes),
         committed_kv_bytes(committed_bytes(total, staging_bytes, hidden_staging_bytes)) {}
  private:

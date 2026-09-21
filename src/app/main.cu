@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <limits>
 #include <cstdlib>
 #include <iostream>
 #include <sstream>
@@ -82,6 +83,13 @@ std::uint32_t parse_prefill_chunk_tokens(std::string_view text) {
   return value;
 }
 
+std::uint32_t parse_prefill_budget_tokens(std::string_view text) {
+  const auto value = parse_nonnegative_u64(text, "--prefill-budget-tokens");
+  if (value > std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("--prefill-budget-tokens must be in 0..4294967295");
+  return static_cast<std::uint32_t>(value);
+}
+
 gewell::nvfp4::ActivationPolicy parse_nvfp4_activation_policy(std::string_view text) {
   if (text == "always") return gewell::nvfp4::ActivationPolicy::always;
   if (text == "prefill") return gewell::nvfp4::ActivationPolicy::prefill;
@@ -122,6 +130,8 @@ bool parse_runtime_option(std::string_view option, std::string_view value,
     settings.mtp_depth = parse_mtp_depth(value);
   } else if (option == "--prefill-chunk-tokens") {
     settings.prefill_chunk_tokens = parse_prefill_chunk_tokens(value);
+  } else if (option == "--prefill-budget-tokens") {
+    settings.prefill_budget_tokens = parse_prefill_budget_tokens(value);
   } else if (option == "--nvfp4-activation-policy") {
     settings.nvfp4_activation_policy = parse_nvfp4_activation_policy(value);
   } else if (option == "--kv-cache-gpu-mib") {
@@ -368,13 +378,14 @@ Options
   --mtp-depth N                      Speculative decoding depth (0 disables MTP);
                                      warns and falls back to 0 without --assistant
   --prefill-chunk-tokens N            Text prefill cap, 1..4096 (default 1024)
+  --prefill-budget-tokens N           Prefill tokens between batch decodes (0: each chunk/head)
   --nvfp4-activation-policy POLICY   always (default) or prefill; prefill keeps NVFP4 decode/MTP activations BF16
-  --attention-local-compute bf16|fp8 Local text prefill matmuls (default bf16)
-  --attention-global-compute bf16|fp8 Global text prefill matmuls (default bf16)
+  --attention-local-compute bf16|fp8 Local text attention, including MTP (default bf16)
+  --attention-global-compute bf16|fp8 Global text attention, including MTP (default bf16)
   --kv-local-format bf16|fp8          Local KV storage (default bf16)
   --kv-global-format bf16|fp8         Compact global KV storage (default bf16)
   --kv-cache-cpu-mib N                Host prefix-cache budget
-  --kv-cache-index-mib N              Host cache-index budget
+  --kv-cache-index-mib N              Host cache-index budget (default 512 MiB)
   --kv-checkpoint-interval-tokens N   Periodic checkpoint spacing (0 disables it)
 
 HTTP options (after serve-http)
@@ -391,7 +402,7 @@ HTTP options (after serve-http)
 Generation options (before generate/caption)
   --temperature T  --top-p P  --top-k K  --seed S  --mtp-depth N
   Batch and server sampling settings belong to individual requests.
-  --mtp-depth and --prefill-chunk-tokens may also precede batching commands.
+  --mtp-depth, --prefill-chunk-tokens, --prefill-budget-tokens may precede batching commands.
   --prefill-chunk-tokens leaves the one-chunk image limit at 1280.
   --qdq-mask PATH precedes generate/generate-batch/run-jobs/replay-rollout.
 
@@ -431,17 +442,20 @@ int main(int argc, char** argv) {
     generation_settings.vision_path = vision_path;
     bool generation_options = false;
     bool batch_sampling_options = false;
+    bool prefill_budget_option = false;
     while (argc >= 2) {
       const std::string_view option(argv[1]);
       if (option != "--mtp-depth" && option != "--temperature" && option != "--top-p" &&
-          option != "--top-k" && option != "--seed" && option != "--prefill-chunk-tokens" &&
+          option != "--top-k" && option != "--seed" && option != "--prefill-chunk-tokens" && option != "--prefill-budget-tokens" &&
           option != "--nvfp4-activation-policy" && option != "--kv-local-format" &&
           option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute") break;
       if (argc < 3) throw std::runtime_error(std::string(option) + " requires a value");
       generation_options = true;
-      batch_sampling_options |= option != "--mtp-depth" && option != "--prefill-chunk-tokens" && option != "--nvfp4-activation-policy" && option != "--kv-local-format" && option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute";
+      prefill_budget_option |= option == "--prefill-budget-tokens";
+      batch_sampling_options |= option != "--mtp-depth" && option != "--prefill-chunk-tokens" && option != "--prefill-budget-tokens" && option != "--nvfp4-activation-policy" && option != "--kv-local-format" && option != "--kv-global-format" && option != "--attention-local-compute" && option != "--attention-global-compute";
       if (option == "--nvfp4-activation-policy") generation_settings.nvfp4_activation_policy = parse_nvfp4_activation_policy(argv[2]);
       if (option == "--prefill-chunk-tokens") generation_settings.prefill_chunk_tokens = parse_prefill_chunk_tokens(argv[2]);
+      if (option == "--prefill-budget-tokens") generation_settings.prefill_budget_tokens = parse_prefill_budget_tokens(argv[2]);
       if (option == "--attention-local-compute") generation_settings.local_attention_compute = parse_attention_compute(argv[2]);
       if (option == "--attention-global-compute") generation_settings.global_attention_compute = parse_attention_compute(argv[2]);
       if (option == "--kv-local-format") generation_settings.local_kv_format = parse_kv_format(argv[2]);
@@ -468,6 +482,9 @@ int main(int argc, char** argv) {
     }
     if (generation_options && argc >= 2) {
       const std::string_view command(argv[1]);
+      if (prefill_budget_option && command != "generate-batch" &&
+          command != "serve-http" && command != "run-jobs")
+        throw std::runtime_error("--prefill-budget-tokens requires a batching command");
       if (command != "generate" && command != "caption" && command != "generate-batch" &&
           command != "serve-http" && command != "run-jobs")
         throw std::runtime_error("generation options precede generate/caption or batching commands");
@@ -503,7 +520,8 @@ int main(int argc, char** argv) {
           parse_nonnegative_u64(argv[5], "KV_MIB"), argv[6], qdq_mask, generation_settings.mtp_depth,
           argc == 8 ? argv[7] : "", generation_settings.prefill_chunk_tokens, generation_settings.nvfp4_activation_policy,
           generation_settings.local_kv_format, generation_settings.global_kv_format,
-          generation_settings.local_attention_compute, generation_settings.global_attention_compute, assistant_path, vision_path);
+          generation_settings.local_attention_compute, generation_settings.global_attention_compute, assistant_path, vision_path,
+          generation_settings.prefill_budget_tokens);
     }
     if (argc >= 2 && std::string_view(argv[1]) == "serve-http") {
       if (batch_sampling_options) throw std::runtime_error("serve-http sampling settings belong to each request");
@@ -512,6 +530,7 @@ int main(int argc, char** argv) {
       settings.vision_path = vision_path;
       settings.mtp_depth = generation_settings.mtp_depth;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
+      settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
       settings.nvfp4_activation_policy = generation_settings.nvfp4_activation_policy;
       settings.local_attention_compute = generation_settings.local_attention_compute;
       settings.global_attention_compute = generation_settings.global_attention_compute;
@@ -559,6 +578,7 @@ int main(int argc, char** argv) {
       settings.kv_cache_gpu_mib = parse_nonnegative_u64(argv[4], "KV_MIB");
       settings.mtp_depth = generation_settings.mtp_depth;
       settings.prefill_chunk_tokens = generation_settings.prefill_chunk_tokens;
+      settings.prefill_budget_tokens = generation_settings.prefill_budget_tokens;
       settings.nvfp4_activation_policy = generation_settings.nvfp4_activation_policy;
       settings.local_attention_compute = generation_settings.local_attention_compute;
       settings.global_attention_compute = generation_settings.global_attention_compute;
