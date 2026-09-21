@@ -25,8 +25,11 @@ read those files from their original source checkpoints.
 ## Download a prepared bundle
 
 HF: 
+
 LeDissolution/Gemma-4-31B-it-Gewell_BF16
+
 LeDissolution/Gemma-4-31B-it-Gewell_G0
+
 
 ## Convert safetensors
 
