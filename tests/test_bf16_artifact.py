@@ -5,18 +5,16 @@ import json
 import struct
 import tempfile
 import unittest
-from contextlib import ExitStack
-from unittest.mock import patch
 from pathlib import Path
 
 MODEL_REVISION = "fixture-revision"
-from tools.convert_bf16 import PreparedSource, Shard, build_manifest, prepare_source
 from tools.bf16_artifact import (
     ALIGNMENT,
     ENTRY_BYTES,
     HEADER_BYTES,
     HEADER_HASH_OFFSET,
     HEADER_USED_BYTES,
+    LM_HEAD_LOGICAL_ID,
     ArtifactError,
     Role,
     SourceTensor,
@@ -35,6 +33,7 @@ from tools.bf16_artifact import (
 )
 from tools.verify_bf16 import validate_manifest, verify_source
 from tools.serving_assets import REQUIRED_ASSETS, serving_metadata
+from tools.safetensors_source import read_snapshot
 
 
 SERVING_ASSET_BYTES = {name: f"fixture: {name}\n".encode() for name in REQUIRED_ASSETS}
@@ -158,16 +157,6 @@ def _write_tiny_manifest_bundle(directory: Path):
         )
         for spec, declaration in zip(specs, sources, strict=True)
     )
-    prepared = PreparedSource(
-        snapshot=directory,
-        index_path=index_path,
-        specs=specs,
-        tensors=sources,
-        shards=tuple(
-            Shard(name, directory / name, size, digest, (0, 0, size, 0))
-            for name, (size, digest) in sorted({name: ((directory / name).stat().st_size, sha256_file(directory / name)) for name in weight_map.values()}.items())
-        ),
-    )
     artifact_path = directory / "weights.gwt"
     written = write_artifact_partial(
         artifact_path,
@@ -179,8 +168,51 @@ def _write_tiny_manifest_bundle(directory: Path):
     verified = _verify(artifact_path, specs)
     for name, data in SERVING_ASSET_BYTES.items():
         (directory / name).write_bytes(data)
-    manifest = build_manifest(contract, prepared, written, artifact_filename=artifact_path.name,
-                              serving=serving_metadata(SERVING_ASSET_BYTES))
+    # Exercise the BF16 verifier with an independent fixture, without relying
+    # on the retired BF16 converter to produce the manifest under test.
+    manifest = {
+        "schema_version": 6,
+        "format": "gemma4-31b-bf16-v4",
+        "model": {key: contract[key] for key in
+                  ("repository", "revision", "config_sha256", "index_sha256")},
+        "artifact": {
+            "file": artifact_path.name,
+            "file_bytes": written.header.file_bytes,
+            "file_sha256": written.file_sha256,
+            "header_sha256": written.header.header_sha256.hex(),
+            "entry_table_sha256": written.header.entry_table_sha256.hex(),
+            "payload_sha256": written.header.payload_sha256.hex(),
+        },
+        "layout": {
+            "alignment": ALIGNMENT,
+            "logical_data_bytes": written.header.logical_data_bytes,
+            "logical_tensor_count": written.header.logical_tensor_count,
+            "physical_tensor_count": written.header.physical_tensor_count,
+            "payload_bytes": written.header.payload_bytes,
+            "target": "sm_120a",
+        },
+        "aliases": [{"logical_id": LM_HEAD_LOGICAL_ID, "name": "lm_head.weight",
+                     "target": "embed_tokens.weight", "target_physical_id": 0}],
+        "serving": serving_metadata(SERVING_ASSET_BYTES),
+        "source": {
+            "index": {"file": index_path.name, "byte_length": index_path.stat().st_size,
+                      "sha256": INDEX_SHA256},
+            "shards": [{"file": name, "byte_length": (directory / name).stat().st_size,
+                        "sha256": sha256_file(directory / name)}
+                       for name in sorted(set(weight_map.values()))],
+        },
+        "tensors": [
+            {"physical_id": spec.physical_id, "name": spec.name,
+             "layer": None if spec.layer == -1 else spec.layer,
+             "role": spec.role.name.lower(), "shape": list(spec.shape),
+             "dtype": "BF16", "layout": "C_ORDER",
+             "file_offset": entry.file_offset, "byte_length": entry.byte_length,
+             "slot_length": align_up(entry.byte_length), "sha256": entry.sha256_hex,
+             "source_name": spec.source_name, "source_component": spec.source_component,
+             "source_shard": source.shard_name, "source_offset": source.offset}
+            for spec, source, entry in zip(specs, sources, written.entries, strict=True)
+        ],
+    }
     manifest_path = directory / "manifest.json"
     manifest_path.write_bytes(canonical_json_bytes(manifest))
     return artifact_path, manifest_path, manifest, verified, specs, contract
@@ -424,27 +456,20 @@ class Bf16ArtifactTests(unittest.TestCase):
             config_hash = hashlib.sha256((directory / "config.json").read_bytes()).hexdigest()
             index_hash = hashlib.sha256((directory / "model.safetensors.index.json").read_bytes()).hexdigest()
             contract = {**old_contract, "config_sha256": config_hash, "index_sha256": index_hash}
-            pins = {name: ((directory / name).stat().st_size, hashlib.sha256((directory / name).read_bytes()).hexdigest())
-                    for name in {tensor["source_shard"] for tensor in manifest["tensors"]}}
-            with ExitStack() as stack:
-                for module in ("tools.convert_bf16", "tools.verify_bf16"):
-                    stack.enter_context(patch(f"{module}.expected_model_tensor_names", return_value={s.source_name for s in specs}))
-                stack.enter_context(patch("tools.convert_bf16.expected_tensor_specs", return_value=specs))
-                stack.enter_context(patch("tools.convert_bf16.PRODUCTION_TENSOR_COUNT", len(specs)))
-                prepared = prepare_source(contract, hash_shards=True)
-                self.assertEqual(len(prepared.shards), 2)
-                self.assertFalse((directory / "model.safetensors").exists())
+            prepared = read_snapshot(directory, specs)
+            self.assertEqual(len({weight.tensor.path for weight in prepared.weights}), 2)
+            self.assertFalse((directory / "model.safetensors").exists())
+            verify_source(manifest, specs, contract)
+            shard = directory / manifest["source"]["shards"][0]["file"]
+            original = shard.read_bytes()
+            shard.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+            read_snapshot(directory, specs)  # Modified weights are a valid new source.
+            with self.assertRaisesRegex(ArtifactError, "source shard SHA-256 mismatch"):
                 verify_source(manifest, specs, contract)
-                shard = directory / next(iter(pins))
-                original = shard.read_bytes()
-                shard.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
-                prepare_source(contract, hash_shards=True)  # Modified weights are a valid new source.
-                with self.assertRaisesRegex(ArtifactError, "source shard SHA-256 mismatch"):
-                    verify_source(manifest, specs, contract)
-                shard.write_bytes(original)
-                (directory / "config.json").write_text('{"wrong":true}')
-                with self.assertRaisesRegex(ArtifactError, "target config SHA-256 mismatch"):
-                    verify_source(manifest, specs, contract)
+            shard.write_bytes(original)
+            (directory / "config.json").write_text('{"wrong":true}')
+            with self.assertRaisesRegex(ArtifactError, "target config SHA-256 mismatch"):
+                verify_source(manifest, specs, contract)
 
     def test_manifest_does_not_bind_oracle_contract_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as value:

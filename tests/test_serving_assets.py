@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tools import convert as converter
+from tools import nvfp4_artifact as native
 from tools.bf16_artifact import ArtifactError, canonical_json_bytes, load_json_object
 from tests.test_bf16_artifact import MODEL_REVISION
-from tools.convert_bf16 import PreparedSource, Shard, convert, main as convert_main, parse_args as converter_args
 from tools.serving_assets import (
     REQUIRED_ASSETS,
     publish_serving_assets,
@@ -23,6 +24,7 @@ from tools.verify_bf16 import validate_manifest
 from tests.test_bf16_artifact import (
     SERVING_ASSET_BYTES,
     SERVING_ASSET_SHA256,
+    _tiny_specs,
     _tiny_sources,
     _write_tiny_manifest_bundle,
 )
@@ -149,48 +151,45 @@ class ServingAssetsTests(unittest.TestCase):
                     validate_manifest(manifest_path, artifact, verified, specs, contract)
 
     def test_cli_defaults_and_overrides_select_serving_snapshot_independently(self) -> None:
-        self.assertEqual(converter_args(["--snapshot", str(self.snapshot), "--plan"]).serving_snapshot, None)
-        self.assertEqual(converter_args(["--snapshot", str(self.snapshot), "--plan", "--serving-snapshot", str(self.snapshot)]).serving_snapshot,
-                         self.snapshot)
-        contract = object()
         for arguments, snapshot in (([], None),
                                     (["--serving-snapshot", str(self.snapshot)], self.snapshot)):
-            with patch("tools.convert_bf16.load_model", return_value=contract), \
-                    patch("tools.convert_bf16.convert", return_value=(self.output / "weights.gwt", self.output / "manifest.json")) as conversion, \
+            with patch.object(converter, "convert", return_value=(self.output / "weights.gwt", self.output / "manifest.json")) as conversion, \
                     patch("sys.stdout", new_callable=io.StringIO):
-                self.assertEqual(convert_main(["--snapshot", str(self.snapshot), "--output", str(self.output), *arguments]), 0)
-                self.assertEqual(conversion.call_args.kwargs["serving_snapshot"], snapshot)
+                self.assertEqual(converter.main(["--snapshot", str(self.snapshot), "--output", str(self.output), *arguments]), 0)
+                conversion.assert_called_once_with(self.snapshot, "", {}, self.output, snapshot)
 
     def test_converter_publishes_assets_and_failed_copy_cannot_publish_manifest(self) -> None:
-        original_artifact, _, _, _, specs, contract = _write_tiny_manifest_bundle(self.output)
+        specs = _tiny_specs()
+        _, raw_tensors = _tiny_sources(self.output, specs)
         # Source configuration and templates are not runtime bundle assets.
+        (self.output / "tokenizer.json").write_bytes(b"weight snapshot tokenizer")
         (self.output / "tokenizer_config.json").write_bytes(b"old weight snapshot tokenizer config")
         (self.output / "chat_template.jinja").write_bytes(b"old weight snapshot chat template")
-        sources, _ = _tiny_sources(self.output, specs)
-        prepared = PreparedSource(
-            snapshot=self.output, index_path=self.output / "model.safetensors.index.json",
-            specs=specs, tensors=sources,
-            shards=tuple(Shard(name, self.output / name, size, digest, (0, 0, size, 0))
-                         for name, (size, digest) in {source.shard_name: (source.path.stat().st_size, "0" * 64) for source in sources}.items()),
-        )
         destination = self.root / "converted"
-        with patch("tools.convert_bf16.prepare_source", return_value=prepared), \
-                patch("tools.convert_bf16.assert_source_unchanged"):
-            artifact, manifest_path = convert(contract, destination, serving_snapshot=self.snapshot)
+        with patch.object(converter.bf16, "expected_tensor_specs", return_value=specs):
+            artifact, manifest_path = converter.convert(self.output, "", {}, destination, serving_snapshot=self.snapshot)
             manifest = load_json_object(manifest_path, canonical=True)
             self.assertTrue(artifact.is_file())
             self.assertEqual(manifest["schema_version"], 6)
-            self.assertEqual(manifest["model"]["revision"], MODEL_REVISION)
+            self.assertEqual(manifest["format"], native.MIXED_FORMAT_NAME)
+            self.assertEqual(manifest["model"]["revision"], "")
             self.assertEqual(manifest["serving"]["revision"], "")
-            self.assertEqual(artifact.read_bytes(), original_artifact.read_bytes())
+            verified = native.verify_artifact_file(artifact, specs)
+            with artifact.open("rb") as stream:
+                for entry, raw in zip(verified.entries, raw_tensors, strict=True):
+                    self.assertEqual(entry.storage_type, native.StorageType.BF16)
+                    stream.seek(entry.file_offset)
+                    self.assertEqual(stream.read(entry.byte_length), raw)
             validate_serving_assets(destination, manifest["serving"])
+            self.assertEqual((destination / "tokenizer.json").read_bytes(),
+                             (self.snapshot / "tokenizer.json").read_bytes())
             self.assertEqual({path.name for path in destination.iterdir()},
                              {"weights.gwt", "manifest.json", "tokenizer.json"})
 
             failed = self.root / "failed"
-            with patch("tools.convert_bf16.publish_serving_assets", side_effect=OSError("copy failed")):
+            with patch.object(converter, "publish_serving_assets", side_effect=OSError("copy failed")):
                 with self.assertRaisesRegex(OSError, "copy failed"):
-                    convert(contract, failed, serving_snapshot=self.snapshot)
+                    converter.convert(self.output, "", {}, failed, serving_snapshot=self.snapshot)
             self.assertFalse((failed / "manifest.json").exists())
             self.assertFalse((failed / "weights.gwt").exists())
             self.assertFalse(list(failed.glob("*.partial")))
