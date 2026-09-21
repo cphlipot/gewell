@@ -1,15 +1,12 @@
-# Gewell
+<img width="1672" height="350" alt="gewell" src="https://github.com/user-attachments/assets/53d54098-4310-4714-a343-a9cf6d84600f" />
 
 Gewell is a single-GPU inference engine for Gemma 4 31B (more to come) on NVIDIA Blackwell
-GPUs with compute capability 12.0 (`sm_120a`) (*potentially* more to come). It serves text and image chat
-through an OpenAI-compatible HTTP API and supports local token-based generation.
+GPUs with compute capability 12.0 (`sm_120a`) (*potentially* more to come).
 
 Features include streamed responses, tool conversations, JSON-constrained
 answers, continuous batching, prefix caching with optional CPU storage, and
 MTP speculative decoding using the Gemma assistant. Local and global
 KV storage can independently use BF16 or FP8 (no, I will not be implementing FP4. Go lobotomize your models somewhere else).
-
-The project is pre-release: artifact formats and CLI contracts can change.
 
 ## Get started
 
@@ -25,7 +22,3 @@ The project is pre-release: artifact formats and CLI contracts can change.
 - [Prefix caching, prefill, and retention](docs/cache.md)
 - [Offline jobs and token files](docs/offline.md)
 - [HTTP benchmarking](docs/benchmark.md)
-
-This repository contains engine sources, tests, documentation, and preparation
-tools. Model weights are distributed separately in Hugging Face model repos.
-Use the complete bundle and revision specified by its model card.
