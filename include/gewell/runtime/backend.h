@@ -10,6 +10,7 @@
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -52,6 +53,8 @@ struct VerificationResult {
 struct MtpOutcome {
   VerificationResult verification;
   std::vector<std::uint32_t> tokens;
+  // Nonempty only for a request-local sampling failure before KV commit.
+  std::string error;
 };
 struct BatchMtpOutcome {
   std::vector<MtpOutcome> requests;

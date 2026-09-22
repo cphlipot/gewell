@@ -1200,6 +1200,75 @@ void full_vocabulary_test() {
             << " scratch_bytes=" << fixture.bytes << '\n';
 }
 
+void dense_zero_mass_rounding_test() {
+  constexpr unsigned vocabulary = 262144;
+  Fixture fixture(vocabulary);
+  Device<__nv_bfloat16> logits(vocabulary);
+  Device<float> probabilities(vocabulary), target(2 * vocabulary), draft(vocabulary);
+  Device<float> uniform(1);
+  Device<unsigned> token(1), output(2);
+  Device<mtp::Result> result(1);
+  // Reproduces the production failure with finite BF16 logits, top-k disabled
+  // and top-p=1. A parallel FP32 scan can increase across a zero-weight bucket.
+  std::mt19937 rng(20260922);
+  std::uniform_real_distribution<float> log_weight(-12.0F, 0.0F);
+  std::vector<float> weights(vocabulary, 0.0F);
+  const auto support = 8 + rng() % 249;
+  for (unsigned i = 0; i < support; ++i) {
+    const float weight = std::exp(log_weight(rng));
+    weights[rng() % vocabulary] += weight;
+  }
+  for (auto& weight : weights) weight = weight > 0 ? std::log(weight) : -30.0F;
+  logits.put(bf16(weights));
+  fixture.clear();
+  mtp::build_distribution(logits.get(), vocabulary, 0.7F, 1.0F, 0,
+      probabilities.get(), fixture.scratch.get(), fixture.bytes, fixture.status.get());
+  fixture.success();
+  const auto row = probabilities.read(vocabulary);
+  check_cuda(cudaMemcpy(target.get(), probabilities.get(), vocabulary * sizeof(float),
+                        cudaMemcpyDeviceToDevice), "copy rounding target row");
+  check_cuda(cudaMemcpy(target.get() + vocabulary, probabilities.get(), vocabulary * sizeof(float),
+                        cudaMemcpyDeviceToDevice), "copy rounding bonus row");
+  const auto zero = static_cast<unsigned>(std::find(row.begin(), row.end(), 0.0F) - row.begin());
+  expect(zero < vocabulary, "rounding fixture has no zero-probability token");
+  std::vector<float> one_hot(vocabulary, 0.0F);
+  one_hot[zero] = 1.0F;
+  draft.put(one_hot);
+
+  for (const float draw : {0.2074185908F, 0.0F, 0.5F, std::nextafter(1.0F, 0.0F)}) {
+    uniform.put({draw});
+    fixture.clear();
+    mtp::sample_distribution(probabilities.get(), vocabulary, uniform.get(), token.get(),
+        fixture.scratch.get(), fixture.bytes, fixture.status.get());
+    fixture.success();
+    const auto selected = token.read(1)[0];
+    expect(selected < vocabulary && row[selected] > 0,
+           "dense CDF rounding selected a zero-probability proposal");
+    mtp::verify_sequence(target.get(), probabilities.get(), token.get(), 1, vocabulary,
+        uniform.get(), uniform.get(), output.get(), result.get(), fixture.scratch.get(),
+        fixture.bytes, fixture.status.get());
+    fixture.success();
+    expect(result.read(1)[0].accepted_drafts == 1,
+           "identical target rejected the rounded-CDF proposal");
+    for (const auto id : output.read(2))
+      expect(id < vocabulary && row[id] > 0, "rounded CDF emitted a zero-mass bonus");
+
+    // Force rejection: q is one-hot where p is zero, so the residual is p.
+    token.put({zero});
+    fixture.clear();
+    mtp::verify_sequence(target.get(), draft.get(), token.get(), 1, vocabulary,
+        uniform.get(), uniform.get(), output.get(), result.get(), fixture.scratch.get(),
+        fixture.bytes, fixture.status.get());
+    fixture.success();
+    expect(result.read(1)[0].accepted_drafts == 0,
+           "disjoint proposal was not rejected");
+    const auto correction = output.read(1)[0];
+    expect(correction < vocabulary && row[correction] > 0,
+           "rounded CDF emitted a zero-mass correction");
+  }
+  std::cout << "mtp_dense_rounding: proposal_bonus_correction_support_ok\n";
+}
+
 void partitioned_validation_test() {
   constexpr unsigned vocabulary = 8193, depth = 3;
   Verification test(vocabulary, depth);
@@ -1248,6 +1317,7 @@ int main(int argc, char** argv) {
     invalid_data_cases();
     sequence_distribution_test();
     full_vocabulary_test();
+    dense_zero_mass_rounding_test();
     partitioned_validation_test();
     compact_distribution_tests();
     compact_batch_tests();

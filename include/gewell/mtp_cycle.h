@@ -29,6 +29,9 @@ struct Outcome {
   float select_gpu_milliseconds{};
   std::uint32_t constraint_draft_downloads{}, constraint_mask_uploads{};
   std::size_t constraint_draft_bytes{}, constraint_mask_bytes{};
+  // Batch returns request-local sampling failures without committing any KV.
+  // Failed outcomes have no tokens; CUDA/host execution failures still throw.
+  mtp_sampling::Status status{mtp_sampling::Status::success};
 };
 
 // One frozen-prefix assistant proposal sequence followed by target verification

@@ -160,6 +160,8 @@ void verify_greedy_sequences(
 
 // Sample a normalized, nonnegative FP32 row using a device uniform in [0,1).
 // FP32 inclusive-scan accumulation and strict CDF comparison define the draw.
+// Rounded CDF steps at zero-weight entries advance to positive support (or
+// the last positive entry for a trailing plateau); zero mass is never sampled.
 void sample_distribution(const float* probs, std::uint32_t vocabulary_size,
                          const float* uniform, std::uint32_t* output_token,
                          void* scratch, std::size_t scratch_size, Status* status,

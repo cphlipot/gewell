@@ -166,7 +166,9 @@ class RuntimeBackend final : public runtime::ExecutionBackend {
     output.requests.reserve(result.requests.size());
     for (auto& selected : result.requests)
       output.requests.push_back({{selected.verification.accepted_drafts,
-          selected.verification.output_count, selected.verification.rejected_index}, std::move(selected.tokens)});
+          selected.verification.output_count, selected.verification.rejected_index}, std::move(selected.tokens),
+          selected.status == mtp_sampling::Status::success ? std::string{} :
+              std::string("MTP cycle: ") + mtp_sampling::status_message(selected.status)});
     return output;
   }
   void commit_batch_mtp(

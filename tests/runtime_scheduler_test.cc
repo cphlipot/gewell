@@ -116,6 +116,7 @@ class TestBackend final : public ExecutionBackend {
   void check_constraint_sampling() override {}
   BatchMtpOutcome run_batch_mtp(const std::vector<BatchMtpInput>& inputs) override {
     require(!image_live, "MTP overlapped in-flight image features");
+    if (fail_mtp_execution) throw std::runtime_error("injected MTP execution failure");
     decode_sizes.push_back(inputs.size());
     operations.emplace_back('D', inputs.size());
     BatchMtpOutcome result;
@@ -124,17 +125,26 @@ class TestBackend final : public ExecutionBackend {
       return_probability_flags.push_back(input.return_probabilities);
       require(input.uniforms.size() == 2 * input.depth + 1, "MTP draw block size");
       MtpOutcome output;
-      output.verification = {input.depth, input.depth + 1, input.depth};
-      for (std::uint32_t i = 0; i <= input.depth; ++i) output.tokens.push_back(input.pending_token + i + 1);
+      if (failed_mtp_rows.count(result.requests.size())) {
+        output.verification = {};
+        output.error = "MTP cycle: injected request sampling failure";
+        failed_mtp_executions.insert(input.execution);
+      } else {
+        output.verification = {input.depth, input.depth + 1, input.depth};
+        for (std::uint32_t i = 0; i <= input.depth; ++i) output.tokens.push_back(input.pending_token + i + 1);
+      }
       result.requests.push_back(std::move(output));
     }
+    failed_mtp_rows.clear();
     decode_inflight = true;
     if (on_decode) on_decode();
     return result;
   }
   void commit_batch_mtp(const std::vector<BatchMtpCommit>& inputs) override {
+    require(!inputs.empty(), "empty MTP commit batch");
     commit_batch_sizes.push_back(inputs.size());
     for (const auto& input : inputs) {
+      require(!failed_mtp_executions.count(input.execution), "failed MTP request committed KV");
       commits.push_back(input.count);
       cache->prepare_write(input.execution, input.position, input.count, {});
     }
@@ -154,6 +164,9 @@ class TestBackend final : public ExecutionBackend {
   PersistentCacheManager* cache{};
   std::uint32_t chunk_cap{4}, prefill_rows{};
   bool fail_prefill{};
+  bool fail_mtp_execution{};
+  std::set<std::size_t> failed_mtp_rows;
+  std::set<kv_cache::ExecutionId> failed_mtp_executions;
   bool fail_image{}, fail_hidden{}, image_live{};
   mutable bool image_inflight{}, decode_inflight{};
   std::function<void()> on_decode;
@@ -278,6 +291,69 @@ void mtp_commit_and_stop_fallback() {
                       device->return_probability_flags.end(),
                       [](bool value) { return !value; }),
           "MTP request without logprobs required probability rows");
+}
+void mtp_failure_isolation() {
+  for (const std::set<std::size_t> failed : {
+           std::set<std::size_t>{0}, {1}, {2}, {0, 1, 2}}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    device->failed_mtp_rows = failed;
+    BatchScheduler* running = nullptr;
+    metrics::Snapshot metrics;
+    metrics.mtp_accepted_per_position.resize(3);
+    std::set<std::string> rejected;
+    auto callbacks = output.callbacks();
+    callbacks.metrics = &metrics;
+    callbacks.reject = [&](auto& r, const auto& error, auto reason) {
+      require(reason == BatchFailure::execution && error == "MTP cycle: injected request sampling failure",
+              "MTP request error changed or was reported as capacity failure");
+      require(rejected.insert(r.id).second, "MTP request rejected twice");
+      running->observe_finished(r, true);
+    };
+    callbacks.finish = [&](auto& r) { running->observe_finished(r); r.delivered = true; };
+    callbacks.done = [&](auto& r) { running->observe_finished(r); };
+    auto configured = limits(3); configured.live = true;
+    configured.prefill_budget_tokens = 16;
+    BatchScheduler scheduler(std::move(backend), configured, std::move(callbacks)); running = &scheduler;
+    for (const auto* id : {"a", "b", "c"}) scheduler.submit(request(id, {2,3}, 5));
+    run(scheduler);
+    require(device->decode_sizes == std::vector<std::size_t>{3}, "isolation fixture did not share one MTP batch");
+    for (unsigned row = 0; row < 3; ++row) {
+      const std::string id(1, 'a' + row);
+      require(output.tokens[id].size() == (failed.count(row) ? 1U : 5U),
+              "failed MTP row emitted tokens or lost a healthy neighbor");
+      require(rejected.count(id) == failed.count(row), "wrong MTP request was rejected");
+      require(scheduler.requests[row].cursor == (failed.count(row) ? 2U : 6U),
+              "failed MTP request advanced KV or healthy commit used the wrong row");
+    }
+    require(metrics.failed == failed.size() && metrics.aborted == 0 &&
+                metrics.success_length == 3 - failed.size(), "MTP failure metrics double-counted or lost a request");
+    require(scheduler.cancelled == failed.size() && device->states.empty() &&
+                device->cache->stats().execution_count == 0, "MTP failure leaked execution or hidden state");
+    scheduler.submit(request("after", {3,4}, 5));
+    run(scheduler);
+    require(output.tokens["after"].size() == 5 && rejected.size() == failed.size(),
+            "MTP failure prevented a subsequent request from completing");
+    require(device->states.empty() && device->cache->stats().execution_count == 0,
+            "request following MTP failure leaked state");
+  }
+  // Offline runs remain fail-fast; execution/CUDA errors still propagate in live mode.
+  for (const bool execution_failure : {false, true}) {
+    Output output;
+    auto backend = std::make_unique<TestBackend>(); auto* device = backend.get();
+    device->fail_mtp_execution = execution_failure;
+    device->failed_mtp_rows = {0};
+    auto configured = limits(3); configured.live = execution_failure;
+    BatchScheduler scheduler(std::move(backend), configured, output.callbacks());
+    scheduler.submit(request("failed", {2,3}, 5));
+    bool threw = false;
+    try { run(scheduler); }
+    catch (const std::runtime_error& error) {
+      threw = std::string(error.what()) == (execution_failure ? "injected MTP execution failure"
+          : "MTP cycle: injected request sampling failure");
+    }
+    require(threw && device->commits.empty(), "fatal MTP failure was swallowed or committed KV");
+  }
 }
 void logical_prefill_budgets() {
   for (const auto depth : {0U, 3U}) {
@@ -766,6 +842,7 @@ int main() {
   try {
     using namespace gewell::runtime;
     shared_prefix_and_seed(); cancellation_and_backpressure(); mtp_commit_and_stop_fallback(); failure_cleanup();
+    mtp_failure_isolation();
     logical_prefill_budgets(); logical_budget_under_kv_pressure(); cancellation_and_backpressure(16);
     logical_budget_failed_prefill();
     shared_prefix_and_seed(16); images_share_and_mix_with_text(16);

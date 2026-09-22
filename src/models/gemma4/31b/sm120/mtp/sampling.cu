@@ -387,7 +387,7 @@ void validate_probabilities(const float* probabilities, unsigned rows,
   check_cuda(cudaGetLastError(), "validate MTP probability rows");
 }
 
-__device__ std::uint32_t draw_cdf(const float* cumulative,
+__device__ std::uint32_t draw_cdf(const float* weights, const float* cumulative,
                                 std::uint32_t vocabulary_size, float uniform,
                                 Status* status, Status zero_mass_error) {
   if (!valid_uniform(uniform)) {
@@ -415,16 +415,26 @@ __device__ std::uint32_t draw_cdf(const float* cumulative,
     set_error(status, Status::invalid_distribution);
     return UINT_MAX;
   }
-  return low;
+  if (weights[low] > 0.0F) return low;
+  // Parallel prefix reductions can round upward across a zero-weight bucket.
+  // Keep the normal binary-search path, but never emit outside the support:
+  // advance to the next positive bucket, or the last positive bucket when
+  // rounding introduced mass in a trailing zero plateau.
+  for (std::uint32_t token = low + 1; token < vocabulary_size; ++token)
+    if (weights[token] > 0.0F) return token;
+  while (low > 0)
+    if (weights[--low] > 0.0F) return low;
+  set_error(status, zero_mass_error);
+  return UINT_MAX;
 }
 
-__global__ void sample_cdf_kernel(const float* cumulative,
+__global__ void sample_cdf_kernel(const float* weights, const float* cumulative,
                                   std::uint32_t vocabulary_size,
                                   const float* uniform,
                                   std::uint32_t* output_token, Status* status) {
   *output_token = UINT_MAX;
   if (*status == Status::success) {
-    *output_token = draw_cdf(cumulative, vocabulary_size, *uniform, status,
+    *output_token = draw_cdf(weights, cumulative, vocabulary_size, *uniform, status,
                              Status::invalid_distribution);
   }
 }
@@ -600,7 +610,7 @@ __global__ void make_final_weights_kernel(
                        : fmaxf(target_probs[offset] - draft_probs[offset], 0.0F);
 }
 
-__global__ void sample_final_kernel(const float* cumulative,
+__global__ void sample_final_kernel(const float* weights, const float* cumulative,
                                     std::uint32_t vocabulary_size,
                                     std::uint32_t draft_count,
                                     const float* final_uniform,
@@ -611,7 +621,7 @@ __global__ void sample_final_kernel(const float* cumulative,
     return;
   }
   const std::uint32_t token = draw_cdf(
-      cumulative, vocabulary_size, *final_uniform, status,
+      weights, cumulative, vocabulary_size, *final_uniform, status,
       result->accepted_drafts == draft_count ? Status::invalid_distribution
                                              : Status::zero_residual_mass);
   if (*status == Status::success) {
@@ -1069,7 +1079,7 @@ void sample_distribution(const float* probs, std::uint32_t vocabulary_size,
   validate_probabilities(probs, 1, vocabulary_size, scratch, plan, status, stream);
   auto* cumulative = at<float>(scratch, plan.cumulative);
   scan(probs, cumulative, vocabulary_size, scratch, plan, stream);
-  sample_cdf_kernel<<<1, 1, 0, stream>>>(cumulative, vocabulary_size, uniform,
+  sample_cdf_kernel<<<1, 1, 0, stream>>>(probs, cumulative, vocabulary_size, uniform,
                                        output_token, status);
   check_cuda(cudaGetLastError(), "sample MTP probability row");
 }
@@ -1133,7 +1143,7 @@ void verify_sequence(const float* target_probs, const float* draft_probs,
   check_cuda(cudaGetLastError(), "verify MTP proposals and form residual");
   scan(weights, cumulative, vocabulary_size, scratch, plan, stream);
   sample_final_kernel<<<1, 1, 0, stream>>>(
-      cumulative, vocabulary_size, draft_count, final_uniform, output_ids,
+      weights, cumulative, vocabulary_size, draft_count, final_uniform, output_ids,
       result, status);
   check_cuda(cudaGetLastError(), "sample MTP correction or bonus");
 }

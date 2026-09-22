@@ -24,12 +24,17 @@ read those files from their original source checkpoints.
 
 ## Download a prepared bundle
 
-HF: 
+Download a published bundle into a local directory:
 
-LeDissolution/Gemma-4-31B-it-Gewell_BF16
+```bash
+MODEL_REPO=organization/model-bundle
+MODEL_DIR=/absolute/path/to/model-bundle
+hf download "$MODEL_REPO" --local-dir "$MODEL_DIR"
+```
 
-LeDissolution/Gemma-4-31B-it-Gewell_G0
-
+Use `hf auth login` if the repo requires authentication. An optional
+`--revision` selects a particular release for reproducibility. Once the
+bundle is local, serving needs no Hugging Face connection.
 
 ## Convert safetensors
 

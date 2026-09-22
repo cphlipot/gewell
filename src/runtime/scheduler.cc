@@ -883,6 +883,12 @@ bool BatchScheduler::step() {
         for (std::size_t row = 0; row < indices.size(); ++row) {
           auto& request = requests[indices[row]];
           const auto& selected = result.requests[row];
+          if (!selected.error.empty()) {
+            if (!limits.live) throw std::runtime_error(selected.error);
+            callbacks.reject(request, selected.error, BatchFailure::execution);
+            cancel(indices[row]);
+            continue;
+          }
           auto count = static_cast<std::uint32_t>(selected.tokens.size());
           if (request.honor_eos)
             for (std::uint32_t i = 0; i < count; ++i)
@@ -909,10 +915,11 @@ bool BatchScheduler::step() {
                 selected.verification.rejected_index < count;
           }
         }
-        backend.commit_batch_mtp(commits);
+        if (!commits.empty()) backend.commit_batch_mtp(commits);
         backend.end_step("end batch MTP decode");
         backend.synchronize("complete batch MTP commit");
         for (std::size_t row = 0; row < indices.size(); ++row) {
+          if (!result.requests[row].error.empty()) continue;
           auto& request = requests[indices[row]];
           const auto& tokens = result.requests[row].tokens;
           for (std::uint32_t i = 0; i < emitted[row]; ++i)

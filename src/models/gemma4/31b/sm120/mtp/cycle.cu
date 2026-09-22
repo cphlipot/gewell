@@ -820,9 +820,13 @@ BatchOutcome Batch::run(const std::vector<BatchInput>& inputs, cudaStream_t stre
   }
   check(cudaStreamSynchronize(stream), "complete batch MTP selection");
   for (std::size_t i = 0; i < inputs.size(); ++i) {
-    require(statuses[i] == mtp_sampling::Status::success,
-            mtp_sampling::status_message(statuses[i]));
     auto& result = outcome.requests[i];
+    result.status = statuses[i];
+    if (result.status != mtp_sampling::Status::success) {
+      result.verification = {};
+      result.tokens.clear();
+      continue;
+    }
     require(result.verification.output_count > 0 &&
                 result.verification.output_count <= result.tokens.size(),
             "invalid batch MTP output count");
